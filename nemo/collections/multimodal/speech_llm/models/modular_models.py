@@ -945,7 +945,7 @@ class ModularAudioGPTModel(MegatronGPTSFTModel):
             with open_dict(cfg):
                 cfg.model.perception = model_cfg.perception
 
-            audio_model, _ = cls.get_audio_encoder_models_and_configs(cfg)
+            audio_model, _ = cls.get_audio_encoder_models_and_configs(cfg.model)
             speaker_model, _ = cls.get_speaker_model_and_config(cfg)
             model = cls.load_pretrained_audio_weights(cfg, model, audio_model, speaker_model)
         return model
