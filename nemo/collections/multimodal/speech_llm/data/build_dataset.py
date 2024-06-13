@@ -218,7 +218,7 @@ def build_salm_dataloader(dataset, data_cfg, consumed_samples=0, is_predict=Fals
         data_parallel_rank=parallel_state.get_data_parallel_rank(),
         data_parallel_size=parallel_state.get_data_parallel_world_size(),
         drop_last=data_cfg.drop_last,
-        pad_samples_to_global_batch_size=not data_cfg.drop_last,
+        # pad_samples_to_global_batch_size=not data_cfg.drop_last,
     )
 
     dataloader = torch.utils.data.DataLoader(
