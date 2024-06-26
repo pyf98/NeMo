@@ -31,6 +31,7 @@ from nemo.collections.common.data.lhotse.text_adapters import (
     LhotseTextPairAdapter,
     NeMoSFTJsonlAdapter,
 )
+from nemo.collections.common.data.lhotse.text_adapters_gemma import GemmaSFTJsonlAdapter
 from nemo.collections.common.parts.preprocessing.manifest import get_full_path
 
 
@@ -62,7 +63,7 @@ def read_cutset_from_config(config: DictConfig) -> Tuple[CutSet, bool]:
 
 
 KNOWN_DATASET_CONFIG_TYPES = frozenset(
-    ("nemo", "nemo_tarred", "lhotse", "lhotse_shar", "txt", "txt_pair", "nemo_sft_jsonl", "group")
+    ("nemo", "nemo_tarred", "lhotse", "lhotse_shar", "txt", "txt_pair", "nemo_sft_jsonl", "gemma_sft_jsonl", "group")
 )
 
 
@@ -144,7 +145,7 @@ def read_dataset_config(config) -> tuple[CutSet, bool]:
     return cuts, is_tarred
 
 
-def parse_group(grp_cfg: DictConfig, propagate_attrs: dict) -> [CutSet, bool]:
+def parse_group(grp_cfg: DictConfig, propagate_attrs: dict) -> Tuple[CutSet, bool]:
     assert grp_cfg.type in KNOWN_DATASET_CONFIG_TYPES, f"Unknown item type in dataset config list: {grp_cfg.type=}"
     if grp_cfg.type == "nemo_tarred":
         is_tarred = True
@@ -172,6 +173,9 @@ def parse_group(grp_cfg: DictConfig, propagate_attrs: dict) -> [CutSet, bool]:
     elif grp_cfg.type == "nemo_sft_jsonl":
         is_tarred = True
         cuts = read_nemo_sft_jsonl(grp_cfg)
+    elif grp_cfg.type == "gemma_sft_jsonl":
+        is_tarred = True
+        cuts = read_gemma_sft_jsonl(grp_cfg)
     elif grp_cfg.type == "group":
         cuts, is_tarred = parse_and_combine_datasets(
             grp_cfg.input_cfg,
@@ -214,6 +218,17 @@ def read_txt_pair_paths(config: DictConfig) -> CutSet:
 def read_nemo_sft_jsonl(config: DictConfig) -> CutSet:
     return CutSet(
         NeMoSFTJsonlAdapter(
+            paths=config.paths,
+            language=config.language,
+            shuffle_shards=config.shuffle,
+            shard_seed=config.shard_seed,
+        )
+    ).repeat()
+
+
+def read_gemma_sft_jsonl(config: DictConfig) -> CutSet:
+    return CutSet(
+        GemmaSFTJsonlAdapter(
             paths=config.paths,
             language=config.language,
             shuffle_shards=config.shuffle,
