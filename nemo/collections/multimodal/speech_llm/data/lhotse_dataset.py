@@ -11,6 +11,8 @@ from nemo.collections.multimodal.speech_llm.parts.utils.data_utils import (
     build_loss_mask,
     ceil_to_nearest,
 )
+from nemo.collections.common.data.lhotse.text_adapters_gemma import GemmaSFTExample
+from nemo.collections.common.tokenizers.tokenizer_spec import TokenizerSpec
 
 
 def collate_vectors(items, max_length: int, padding_value):
@@ -113,6 +115,94 @@ class LhotseAudioQuestionAnswerDataset(torch.utils.data.Dataset):
         text_examples = all_cuts.filter(lambda c: isinstance(c, (SourceTargetTextExample, NeMoSFTExample)))
         if text_examples:
             pad_id = self.text_processor.pad_id
+            text_minibatch = dict(
+                text_input_ids=collate_vectors_lhotse([e.input_ids for e in text_examples], padding_value=pad_id),
+                text_answer_ids=collate_vectors_lhotse([e.answer_ids for e in text_examples], padding_value=pad_id),
+                text_context_ids=collate_vectors_lhotse([e.context_ids for e in text_examples], padding_value=pad_id),
+                text_masks=collate_vectors_lhotse([e.mask for e in text_examples], padding_value=0),
+            )
+            ans.update(text_minibatch)
+
+        return ans
+
+
+class LhotseAudioChatDataset(torch.utils.data.Dataset):
+    """
+    This dataset follows the chat template consisting of multi-turn conversations.
+
+    Args:
+        
+    """
+
+    def __init__(
+        self,
+        tokenizer: TokenizerSpec,
+        audio_locator: str,
+        # tokens_to_generate: int,
+        # pad_to_max_length: bool,
+        # max_seq_length: int,
+    ):
+        super().__init__()
+        self.tokenizer = tokenizer
+        self.audio_locator_ids = tokenizer.text_to_ids(audio_locator)
+        self.load_audio = AudioSamples(fault_tolerant=True)
+        # self.text_processor = text_processor
+        # self.tokens_to_generate = tokens_to_generate
+        # self.pad_to_max_length = pad_to_max_length
+        # self.max_seq_length = max_seq_length
+
+    def __getitem__(self, all_cuts: CutSet) -> dict[str, torch.Tensor | list[str] | dict]:
+        ans = {}
+
+        # convert audio cuts to mini-batch
+        cuts = all_cuts.filter(lambda c: isinstance(c, Cut))
+        if cuts:
+            audio, audio_lens, cuts = self.load_audio(cuts)
+
+            return_batch = {}
+            audio_ratio = [1.0] * len(cuts)
+            metadata = []
+            sft_examples = []
+            for _, cut in enumerate(cuts):
+                metadata.append({'audio_filepath': cut.id + '.wav'})
+                sft_examples.append(
+                    GemmaSFTExample(
+                        data={
+                            "system": cut.system,
+                            "mask": cut.mask,
+                            "dataset": cut.dataset,
+                            "conversations": cut.conversations,
+                        },
+                        language=cut.supervisions[0].language
+                    ).tokenize(self.tokenizer)
+                )
+
+            pad_id = self.tokenizer.pad_id
+            collated_text_data = dict(
+                tokens=collate_vectors_lhotse([e.input_ids for e in sft_examples], padding_value=pad_id),   # this includes bos and eos
+                tokens_length=torch.LongTensor([len(e.input_ids) for e in sft_examples]),
+                loss_mask=collate_vectors_lhotse([e.mask for e in sft_examples], padding_value=0),  # this includes bos and eos
+                contexts=collate_vectors_lhotse([e.context_ids for e in sft_examples], padding_value=pad_id),   # this includes bos
+                context_lengths=torch.LongTensor([len(e.context_ids) for e in sft_examples]),
+                answers=collate_vectors_lhotse([e.answer_ids for e in sft_examples], padding_value=pad_id),   # this includes eos
+            )
+            return_batch.update(
+                {
+                    "sample_ids": list(cuts.ids),
+                    "audio_signal": audio,
+                    "audio_signal_length": audio_lens,
+                    "audio_ratio": torch.FloatTensor(audio_ratio),
+                    "metadata": metadata,
+                    "audio_locator_ids": torch.LongTensor(self.audio_locator_ids),
+                    **collated_text_data,
+                }
+            )
+            ans.update(return_batch)
+
+        # convert text examples to tensors
+        text_examples = all_cuts.filter(lambda c: isinstance(c, (SourceTargetTextExample, NeMoSFTExample)))
+        if text_examples:
+            pad_id = self.tokenizer.pad_id
             text_minibatch = dict(
                 text_input_ids=collate_vectors_lhotse([e.input_ids for e in text_examples], padding_value=pad_id),
                 text_answer_ids=collate_vectors_lhotse([e.answer_ids for e in text_examples], padding_value=pad_id),

@@ -57,6 +57,7 @@ from nemo.core.classes.common import PretrainedModelInfo
 from nemo.core.classes.mixins import adapter_mixins
 from nemo.utils import AppState, logging, model_utils
 from nemo.utils.model_utils import inject_model_parallel_rank
+from lhotse.dataset.collation import collate_vectors as collate_vectors_lhotse
 
 try:
     from apex.transformer.pipeline_parallel.utils import _reconfigure_microbatch_calculator, get_num_microbatches
@@ -207,54 +208,54 @@ class ModularAudioGPTModel(SpeechLLMAdapterMixin, MegatronGPTSFTModel):
         attention_mask = attention_mask < 0.5
         return attention_mask
 
-    def _concat_features(self, embs1, emb1_lens, embs2, emb2_lens):
-        """Concatenate two sets of embeddings and their lengths."""
-        concat_emb = []
-        concat_len = []
-        for emb1, emb1_len, emb2, emb2_len in zip(embs1, emb1_lens, embs2, emb2_lens):
-            new_len = emb1_len + emb2_len
-            new_emb = torch.concat([emb1[:emb1_len], emb2[:emb2_len]], axis=0)
-            padded_new_emb = torch.zeros(emb1.shape[0] + emb2.shape[0], emb1.shape[-1], device=emb1.device)
-            padded_new_emb[:new_len, ...] = new_emb
-            concat_emb.append(padded_new_emb)
-            concat_len.append(new_len)
-        concat_emb = torch.stack(concat_emb, dim=0)
-        concat_len = torch.stack(concat_len, dim=0)
-        return concat_emb, concat_len
+    # def _concat_features(self, embs1, emb1_lens, embs2, emb2_lens):
+    #     """Concatenate two sets of embeddings and their lengths."""
+    #     concat_emb = []
+    #     concat_len = []
+    #     for emb1, emb1_len, emb2, emb2_len in zip(embs1, emb1_lens, embs2, emb2_lens):
+    #         new_len = emb1_len + emb2_len
+    #         new_emb = torch.concat([emb1[:emb1_len], emb2[:emb2_len]], axis=0)
+    #         padded_new_emb = torch.zeros(emb1.shape[0] + emb2.shape[0], emb1.shape[-1], device=emb1.device)
+    #         padded_new_emb[:new_len, ...] = new_emb
+    #         concat_emb.append(padded_new_emb)
+    #         concat_len.append(new_len)
+    #     concat_emb = torch.stack(concat_emb, dim=0)
+    #     concat_len = torch.stack(concat_len, dim=0)
+    #     return concat_emb, concat_len
 
-    def _concat_multi_features(
-        self,
-        encoded: List[torch.Tensor],
-        encoded_len: List[torch.Tensor],
-        input_embeds: torch.Tensor,
-        input_length: torch.Tensor,
-        context_start_idx: List[List[int]],
-    ):
-        """Concatenate multiple audio features with text segments."""
-        encoder_input_list, encoder_length_list = [], []
-        batch_size = input_embeds.size(0)
-        max_length = 0
-        for i in range(batch_size):
-            start_idx_list_i = context_start_idx[i] + [
-                input_embeds.size(1)
-            ]  # use input_embeds instead of input_length to handle tokens_to_generate in inference
-            input_len_list = [start_idx_list_i[j + 1] - start_idx_list_i[j] for j in range(len(start_idx_list_i) - 1)]
-            input_emb_list = input_embeds[i].split(input_len_list)
-            encoder_input_i = [input_emb_list[0]]
-            for j in range(1, len(input_emb_list)):
-                encoder_input_i.append(encoded[i][j - 1][: encoded_len[i][j - 1]])
-                encoder_input_i.append(input_emb_list[j])
-            encoder_input_i = torch.cat(encoder_input_i)  # T, C
-            encoder_length_i = encoded_len[i].sum() + input_length[i]  # total length of audio and text features
-            max_length = max(max_length, encoder_input_i.size(0))
-            encoder_input_list.append(encoder_input_i)
-            encoder_length_list.append(encoder_length_i)
+    # def _concat_multi_features(
+    #     self,
+    #     encoded: List[torch.Tensor],
+    #     encoded_len: List[torch.Tensor],
+    #     input_embeds: torch.Tensor,
+    #     input_length: torch.Tensor,
+    #     context_start_idx: List[List[int]],
+    # ):
+    #     """Concatenate multiple audio features with text segments."""
+    #     encoder_input_list, encoder_length_list = [], []
+    #     batch_size = input_embeds.size(0)
+    #     max_length = 0
+    #     for i in range(batch_size):
+    #         start_idx_list_i = context_start_idx[i] + [
+    #             input_embeds.size(1)
+    #         ]  # use input_embeds instead of input_length to handle tokens_to_generate in inference
+    #         input_len_list = [start_idx_list_i[j + 1] - start_idx_list_i[j] for j in range(len(start_idx_list_i) - 1)]
+    #         input_emb_list = input_embeds[i].split(input_len_list)
+    #         encoder_input_i = [input_emb_list[0]]
+    #         for j in range(1, len(input_emb_list)):
+    #             encoder_input_i.append(encoded[i][j - 1][: encoded_len[i][j - 1]])
+    #             encoder_input_i.append(input_emb_list[j])
+    #         encoder_input_i = torch.cat(encoder_input_i)  # T, C
+    #         encoder_length_i = encoded_len[i].sum() + input_length[i]  # total length of audio and text features
+    #         max_length = max(max_length, encoder_input_i.size(0))
+    #         encoder_input_list.append(encoder_input_i)
+    #         encoder_length_list.append(encoder_length_i)
 
-        encoder_input = torch.stack(
-            [torch.nn.functional.pad(f, (0, 0, 0, max_length - f.size(0))) for f in encoder_input_list]
-        )
-        encoder_length = torch.LongTensor(encoder_length_list).to(encoder_input.device)
-        return encoder_input, encoder_length
+    #     encoder_input = torch.stack(
+    #         [torch.nn.functional.pad(f, (0, 0, 0, max_length - f.size(0))) for f in encoder_input_list]
+    #     )
+    #     encoder_length = torch.LongTensor(encoder_length_list).to(encoder_input.device)
+    #     return encoder_input, encoder_length
 
     def inject_perception_input(
         self,
@@ -262,22 +263,84 @@ class ModularAudioGPTModel(SpeechLLMAdapterMixin, MegatronGPTSFTModel):
         encoded_len: Union[torch.Tensor, List[torch.Tensor]],
         input_ids: torch.Tensor,
         input_length: torch.Tensor,
-        context_start_idx: Optional[List[List[int]]] = None,
+        loss_mask: torch.Tensor,
+        audio_locator_ids: torch.Tensor,
+        remove_bos_or_eos: bool = True,
     ):
         """Inject audio features into the text input and return the final input embeddings to LLM."""
-        # [b, t, c]
+
         lm_embedding = (
             self.model.language_model.embedding if hasattr(self.model, 'language_model') else self.model.embedding
         )
-        input_embeds = lm_embedding.word_embeddings(input_ids)
-        if isinstance(encoded, torch.Tensor):
-            # single audio
-            encoder_input, encoder_length = self._concat_features(encoded, encoded_len, input_embeds, input_length)
-        else:
-            # concat multiple audios with text segments
-            encoder_input, encoder_length = self._concat_multi_features(
-                encoded, encoded_len, input_embeds, input_length, context_start_idx
-            )
+        input_embeds = lm_embedding.word_embeddings(input_ids)  # [b, t, c]
+
+        PAD_ID = self.tokenizer.pad_id
+        audio_cnt = 0
+        all_input_embeds = []
+        all_input_ids = []
+        all_loss_mask = []
+        for idx, (cur_input_ids, cur_input_length, cur_loss_mask) in enumerate(zip(input_ids, input_length, loss_mask)):
+            cur_input_ids = cur_input_ids[:cur_input_length]
+            cur_loss_mask = cur_loss_mask[:cur_input_length]
+
+            # replace audio locators with audio embeddings
+            new_input_embeds = []
+            new_input_ids = []
+            new_loss_mask = []
+            start_pos = 0
+            for pos in range(cur_input_length - len(audio_locator_ids) + 1):
+                if (cur_input_ids[pos:pos+len(audio_locator_ids)] == audio_locator_ids).all():
+                    # add previous text embeddings
+                    new_input_embeds.append(
+                        input_embeds[idx, start_pos:pos]
+                    )
+                    new_input_ids.append(cur_input_ids[start_pos:pos])
+                    new_loss_mask.append(cur_loss_mask[start_pos:pos])
+
+                    # add current audio embeddings
+                    new_input_embeds.append(encoded[audio_cnt, :encoded_len[audio_cnt]])
+                    new_input_ids.append(
+                        torch.empty(encoded_len[audio_cnt]).to(cur_input_ids).fill_(PAD_ID)
+                    )
+                    new_loss_mask.append(
+                        torch.empty(encoded_len[audio_cnt]).to(cur_loss_mask).fill_(0)
+                    )
+
+                    audio_cnt += 1
+                    start_pos = pos + len(audio_locator_ids)
+
+            # add the last segment of text embeddings
+            new_input_embeds.append(input_embeds[idx, start_pos:cur_input_length])
+            new_input_ids.append(cur_input_ids[start_pos:])
+            new_loss_mask.append(cur_loss_mask[start_pos:])
+
+            new_input_embeds = torch.cat(new_input_embeds)
+            new_input_ids = torch.cat(new_input_ids)
+            new_loss_mask = torch.cat(new_loss_mask)
+
+            all_input_embeds.append(new_input_embeds)
+            all_input_ids.append(new_input_ids)
+            all_loss_mask.append(new_loss_mask)
+        
+        assert audio_cnt == len(encoded), (audio_cnt, len(encoded))
+
+        encoder_length = torch.LongTensor([len(x) for x in all_input_embeds]).to(input_ids.device)
+        max_length = encoder_length.max().item()
+        encoder_input = torch.stack(
+            [torch.nn.functional.pad(f, (0, 0, 0, max_length - f.size(0))) for f in all_input_embeds]
+        )
+
+        input_ids = collate_vectors_lhotse(all_input_ids, padding_value=PAD_ID)
+        loss_mask = collate_vectors_lhotse(all_loss_mask, padding_value=0)
+
+        if remove_bos_or_eos:   # for training, the input is an entire sentence including context and answer
+            encoder_input = encoder_input[:, :-1]
+            encoder_length = encoder_length - 1
+            labels = input_ids[:, 1:]
+            loss_mask = loss_mask[:, 1:]
+        else:   # for inference, the input is just the context without eos
+            labels = input_ids
+            loss_mask = loss_mask
 
         attention_mask = self._create_attention_mask(encoder_input)
         position_ids = build_position_ids(encoder_input[:, :, 0])
@@ -290,22 +353,22 @@ class ModularAudioGPTModel(SpeechLLMAdapterMixin, MegatronGPTSFTModel):
             position_embeddings = lm_embedding.position_embeddings(position_ids)
             encoder_input = encoder_input + position_embeddings
 
-        encoder_max_length = encoder_input.shape[1]
         if not hasattr(lm_embedding, 'transpose_batch_sequence') or lm_embedding.transpose_batch_sequence:
             encoder_input = encoder_input.transpose(0, 1).contiguous()
         if self.cfg.get("sequence_parallel", False):
             encoder_input = tensor_parallel.mappings.scatter_to_sequence_parallel_region(encoder_input)
-        return encoder_input, attention_mask, encoder_length, position_ids, encoder_max_length
 
-    def _shift_labels_by_emb_len(self, labels, label_lens, emb_lens, max_len, pad_token=0):
-        """Shift labels to the right by the length of the audio embeddings."""
-        shifted_labels = []
-        for label, label_len, emb_len in zip(labels, label_lens, emb_lens):
-            shifted_label = torch.full([max_len], pad_token, device=label.device)
-            shifted_label[emb_len : emb_len + label_len] = label[:label_len]
-            shifted_labels.append(shifted_label)
-        shifted_labels = torch.stack(shifted_labels, dim=0)
-        return shifted_labels
+        return encoder_input, encoder_length, labels, loss_mask, attention_mask, position_ids
+
+    # def _shift_labels_by_emb_len(self, labels, label_lens, emb_lens, max_len, pad_token=0):
+    #     """Shift labels to the right by the length of the audio embeddings."""
+    #     shifted_labels = []
+    #     for label, label_len, emb_len in zip(labels, label_lens, emb_lens):
+    #         shifted_label = torch.full([max_len], pad_token, device=label.device)
+    #         shifted_label[emb_len : emb_len + label_len] = label[:label_len]
+    #         shifted_labels.append(shifted_label)
+    #     shifted_labels = torch.stack(shifted_labels, dim=0)
+    #     return shifted_labels
 
     def _get_text_embeddings(self, text_tokens, position_ids):
         """Get text embeddings for the input text tokens."""
@@ -320,44 +383,30 @@ class ModularAudioGPTModel(SpeechLLMAdapterMixin, MegatronGPTSFTModel):
 
     def prepare_llm_input(self, audio_batch):
         """Prepare input for the LLM."""
-        input_signal = audio_batch['audio_signal']
-        input_signal_length = audio_batch['audio_signal_length']
-
-        input_ids, input_length, labels, loss_mask = (
-            audio_batch['tokens'],
-            audio_batch['tokens_length'],
-            audio_batch['labels'],
-            audio_batch['loss_mask'],
-        )
-
-        num_audios = audio_batch.get("num_audios", None)
-        context_start_idx = audio_batch.get("context_start_idx", None)
 
         # [b, t, c]
         encoded, encoded_len = self.perception(
-            input_signal=input_signal,
-            input_signal_length=input_signal_length,
+            input_signal=audio_batch['audio_signal'],
+            input_signal_length=audio_batch['audio_signal_length'],
             processed_signal=None,
             processed_signal_length=None,
         )
 
-        if num_audios is not None:
-            # split the encoded and encoded_len by num_audios, used when there're multiple audio files per sample
-            encoded = encoded.split(num_audios.tolist())
-            encoded_len = encoded_len.split(num_audios.tolist())
-
-        encoder_input, attention_mask, encoder_length, _, encoder_max_length = self.inject_perception_input(
-            encoded, encoded_len, input_ids, input_length, context_start_idx
+        input_ids, input_length, loss_mask, audio_locator_ids = (
+            audio_batch['tokens'],  # this includes bos and eos
+            audio_batch['tokens_length'],
+            audio_batch['loss_mask'],   # this includes bos and eos
+            audio_batch['audio_locator_ids']
         )
-        if num_audios is not None:
-            # sum up the audio_feat_lens for each sample in the batch
-            encoded_len = torch.stack([torch.sum(lens) for lens in encoded_len])
 
-        # Shift labels to the right
-        labels = self._shift_labels_by_emb_len(labels, input_length, encoded_len, encoder_max_length, pad_token=0)
-        # Loss mask where answer tokens are 1.0 and all other tokens are 0.0
-        loss_mask = self._shift_labels_by_emb_len(
-            loss_mask, input_length, encoded_len, encoder_max_length, pad_token=0
+        encoder_input, encoder_length, labels, loss_mask, attention_mask, position_ids = self.inject_perception_input(
+            encoded=encoded,
+            encoded_len=encoded_len,
+            input_ids=input_ids,
+            input_length=input_length,
+            loss_mask=loss_mask,
+            audio_locator_ids=audio_locator_ids,
+            remove_bos_or_eos=True,
         )
 
         return encoder_input, attention_mask, labels, loss_mask, encoder_length
@@ -1258,7 +1307,7 @@ class ModularAudioGPTModel(SpeechLLMAdapterMixin, MegatronGPTSFTModel):
         labels_text = [self.tokenizer.ids_to_text(a.tolist()) for a in batch['answers']]
         preds_text = [
             self.tokenizer.ids_to_text(t[l.item() :][: data_cfg.get('tokens_to_generate')])
-            for t, l in zip(output['token_ids'], batch['context_lengths'])
+            for t, l in zip(output['token_ids'], batch['encoder_length'])
         ]
 
         if data_cfg.get("end_string", None):
@@ -1356,16 +1405,6 @@ class ModularAudioGPTModel(SpeechLLMAdapterMixin, MegatronGPTSFTModel):
             # for megatron_gpt_eval.py
             if isinstance(batch, list):
                 inference_config['inputs'] = batch
-            elif 'num_audios' in batch:
-                # peft_eval.py
-                inference_config['inputs'] = (
-                    batch['contexts'].cuda(),
-                    batch['context_lengths'].cuda(),
-                    batch['audio_signal'].cuda(),
-                    batch['audio_signal_length'].cuda(),
-                    batch['num_audios'].cuda(),
-                    batch['context_start_idx'],
-                )
             else:
                 # peft_eval.py
                 inference_config['inputs'] = (
@@ -1373,6 +1412,7 @@ class ModularAudioGPTModel(SpeechLLMAdapterMixin, MegatronGPTSFTModel):
                     batch['context_lengths'].cuda(),
                     batch['audio_signal'].cuda(),
                     batch['audio_signal_length'].cuda(),
+                    batch['audio_locator_ids'].cuda(),
                 )
             response = generate(self, **inference_config)
 
@@ -1386,7 +1426,7 @@ class ModularAudioGPTModel(SpeechLLMAdapterMixin, MegatronGPTSFTModel):
         )
 
         # add audio offsets to context lengths for properly decoding only the response
-        batch['context_lengths'] = batch['context_lengths'].cuda() + response['audio_feat_lens']
+        batch['encoder_length'] = response['encoder_length']
 
         return response
 
