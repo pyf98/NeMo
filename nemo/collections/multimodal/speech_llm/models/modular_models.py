@@ -1298,7 +1298,7 @@ class ModularAudioGPTModel(SpeechLLMAdapterMixin, MegatronGPTSFTModel):
         if self.get_inference_config() is None:
             logging.warning(f'inference_config is not set. Use default: {default_inference_config}')
             self.set_inference_config(inference_config=default_inference_config)
-        self._inference_config['add_BOS'] = data_cfg.add_bos
+        # self._inference_config['add_BOS'] = data_cfg.add_bos
         self._inference_config['tokens_to_generate'] = data_cfg.get('tokens_to_generate')
 
         output = self.predict_step(batch, batch_idx, dataloader_idx)
