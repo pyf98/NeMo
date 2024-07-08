@@ -1010,7 +1010,10 @@ class ModularAudioGPTModel(SpeechLLMAdapterMixin, MegatronGPTSFTModel):
             logging.info(f"Running full finetuning since no peft scheme is given.\n{model.summarize()}")
 
         # load audio model weights
-        model = cls.load_pretrained_audio_weights(cfg, model, audio_model, speaker_model)
+        if cfg.model.load_audio_encoder:
+            model = cls.load_pretrained_audio_weights(cfg, model, audio_model, speaker_model)
+        else:
+            logging.info(f"Audio encoder not loaded as cfg.model.load_audio_encoder is set to {cfg.model.load_audio_encoder}")
 
         if 'inference' in cfg:
             inference_cfg = OmegaConf.to_container(cfg.inference, resolve=True)
