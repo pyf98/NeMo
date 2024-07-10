@@ -1031,7 +1031,7 @@ class ModularAudioGPTModel(SpeechLLMAdapterMixin, MegatronGPTSFTModel):
         Returns:
             model: model object with audio encoder weights loaded
         """
-        if model_cfg.freeze_audio_encoder and model_cfg.get("pretrained_audio_model", None) is not None:
+        if model_cfg.freeze_audio_encoder and model_cfg.get("pretrained_audio_model", None) is not None and model_cfg.load_audio_encoder:
             with open_dict(cfg):
                 cfg.model.perception = model_cfg.perception
 
