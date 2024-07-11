@@ -73,3 +73,15 @@ class SpeechLLMAdapterMixin(NLPAdapterModelMixin):
                     f"Unexpected keys found in state_dict: {set(state_dict.keys()) - target_keys}, missing keys in state_dict: {target_keys - set(state_dict.keys())}"
                 )
         super(MegatronGPTModel, self).load_state_dict(state_dict, strict=False)
+
+    def get_peft_state_dict(self):
+        """
+        Gets the keys associated with the adapters only.
+        Add prefix "model." to the keys.
+        """
+
+        peft_state_dict = super().get_peft_state_dict()
+        peft_state_dict_with_prefix = {
+            "model." + k: v for k, v in peft_state_dict.items()
+        }
+        return peft_state_dict_with_prefix
