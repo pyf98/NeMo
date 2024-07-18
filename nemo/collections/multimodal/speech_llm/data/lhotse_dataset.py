@@ -11,6 +11,10 @@ from nemo.collections.multimodal.speech_llm.parts.utils.data_utils import (
     build_loss_mask,
     ceil_to_nearest,
 )
+from nemo.collections.multimodal.speech_llm.data.utils import (
+    combine_context_and_instruction,
+    generate_canary_instruction,
+)
 from nemo.collections.common.data.lhotse.text_adapters_gemma import GemmaSFTExample
 from nemo.collections.common.tokenizers.tokenizer_spec import TokenizerSpec
 
@@ -144,6 +148,7 @@ class LhotseAudioChatDataset(torch.utils.data.Dataset):
     ):
         super().__init__()
         self.tokenizer = tokenizer
+        self.audio_locator = audio_locator
         self.audio_locator_ids = tokenizer.text_to_ids(audio_locator)
         self.load_audio = AudioSamples(fault_tolerant=True)
         # self.text_processor = text_processor
@@ -165,14 +170,78 @@ class LhotseAudioChatDataset(torch.utils.data.Dataset):
             sft_examples = []
             for _, cut in enumerate(cuts):
                 metadata.append({'audio_filepath': cut.id + '.wav'})
+
+                breakpoint()
+
+                # create chat-style SFT data
+                chat_format = getattr(cut, "chat_format", "chat")
+                if chat_format == "canary":
+                    entry = {
+                        "taskname": cut.taskname,
+                        "source_lang": cut.source_lang,
+                        "target_lang": cut.target_lang,
+                        "pnc": cut.pnc,
+                        "answer": cut.answer,
+                    }
+                    sft_data = {
+                        "system": "",
+                        "mask": "User",
+                        "dataset": "",
+                        "conversations": [
+                            {
+                                "from": "User",
+                                "value": combine_context_and_instruction(
+                                    context=self.audio_locator,
+                                    instruction=generate_canary_instruction(entry)
+                                ),
+                                "canonical_form": "",
+                                "label": None
+                            },
+                            {
+                                "from": "Assistant",
+                                "value": entry["answer"],
+                                "canonical_form": "",
+                                "label": None
+                            }
+                        ],
+                    }
+                elif chat_format == "sqa":
+                    sft_data = {
+                        "system": "",
+                        "mask": "User",
+                        "dataset": "",
+                        "conversations": [
+                            {
+                                "from": "User",
+                                "value": combine_context_and_instruction(
+                                    context=self.audio_locator,
+                                    instruction=cut.question,
+                                ),
+                                "canonical_form": "",
+                                "label": None,
+                            },
+                            {
+                                "from": "Assistant",
+                                "value": cut.answer,
+                                "canonical_form": "",
+                                "label": None
+                            }
+                        ],
+                    }
+                elif chat_format == "chat":
+                    # data is already in chat format
+                    sft_data = {
+                        "system": cut.system,
+                        "mask": cut.mask,
+                        "dataset": cut.dataset,
+                        "conversations": cut.conversations,
+                    }
+                else:
+                    raise NotImplementedError(f"Chat format {chat_format} is not supported.")
+
                 sft_examples.append(
                     GemmaSFTExample(
-                        data={
-                            "system": cut.system,
-                            "mask": cut.mask,
-                            "dataset": cut.dataset,
-                            "conversations": cut.conversations,
-                        },
+                        data=sft_data,
                         language=cut.supervisions[0].language
                     ).tokenize(self.tokenizer)
                 )
