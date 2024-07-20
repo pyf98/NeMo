@@ -171,8 +171,6 @@ class LhotseAudioChatDataset(torch.utils.data.Dataset):
             for _, cut in enumerate(cuts):
                 metadata.append({'audio_filepath': cut.id + '.wav'})
 
-                breakpoint()
-
                 # create chat-style SFT data
                 chat_format = getattr(cut, "chat_format", "chat")
                 if chat_format == "canary":
