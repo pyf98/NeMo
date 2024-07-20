@@ -58,6 +58,13 @@ from nemo.core.classes.mixins import adapter_mixins
 from nemo.utils import AppState, logging, model_utils
 from nemo.utils.model_utils import inject_model_parallel_rank
 from lhotse.dataset.collation import collate_vectors as collate_vectors_lhotse
+from nemo.collections.nlp.modules.common.text_generation_strategy import TextGenerationStrategy
+from nemo.collections.nlp.modules.common.transformer.text_generation import (
+    LengthParam,
+    OutputType,
+    SamplingParam,
+    TextGeneration,
+)
 
 try:
     from apex.transformer.pipeline_parallel.utils import _reconfigure_microbatch_calculator, get_num_microbatches
@@ -208,55 +215,6 @@ class ModularAudioGPTModel(SpeechLLMAdapterMixin, MegatronGPTSFTModel):
         attention_mask = attention_mask < 0.5
         return attention_mask
 
-    # def _concat_features(self, embs1, emb1_lens, embs2, emb2_lens):
-    #     """Concatenate two sets of embeddings and their lengths."""
-    #     concat_emb = []
-    #     concat_len = []
-    #     for emb1, emb1_len, emb2, emb2_len in zip(embs1, emb1_lens, embs2, emb2_lens):
-    #         new_len = emb1_len + emb2_len
-    #         new_emb = torch.concat([emb1[:emb1_len], emb2[:emb2_len]], axis=0)
-    #         padded_new_emb = torch.zeros(emb1.shape[0] + emb2.shape[0], emb1.shape[-1], device=emb1.device)
-    #         padded_new_emb[:new_len, ...] = new_emb
-    #         concat_emb.append(padded_new_emb)
-    #         concat_len.append(new_len)
-    #     concat_emb = torch.stack(concat_emb, dim=0)
-    #     concat_len = torch.stack(concat_len, dim=0)
-    #     return concat_emb, concat_len
-
-    # def _concat_multi_features(
-    #     self,
-    #     encoded: List[torch.Tensor],
-    #     encoded_len: List[torch.Tensor],
-    #     input_embeds: torch.Tensor,
-    #     input_length: torch.Tensor,
-    #     context_start_idx: List[List[int]],
-    # ):
-    #     """Concatenate multiple audio features with text segments."""
-    #     encoder_input_list, encoder_length_list = [], []
-    #     batch_size = input_embeds.size(0)
-    #     max_length = 0
-    #     for i in range(batch_size):
-    #         start_idx_list_i = context_start_idx[i] + [
-    #             input_embeds.size(1)
-    #         ]  # use input_embeds instead of input_length to handle tokens_to_generate in inference
-    #         input_len_list = [start_idx_list_i[j + 1] - start_idx_list_i[j] for j in range(len(start_idx_list_i) - 1)]
-    #         input_emb_list = input_embeds[i].split(input_len_list)
-    #         encoder_input_i = [input_emb_list[0]]
-    #         for j in range(1, len(input_emb_list)):
-    #             encoder_input_i.append(encoded[i][j - 1][: encoded_len[i][j - 1]])
-    #             encoder_input_i.append(input_emb_list[j])
-    #         encoder_input_i = torch.cat(encoder_input_i)  # T, C
-    #         encoder_length_i = encoded_len[i].sum() + input_length[i]  # total length of audio and text features
-    #         max_length = max(max_length, encoder_input_i.size(0))
-    #         encoder_input_list.append(encoder_input_i)
-    #         encoder_length_list.append(encoder_length_i)
-
-    #     encoder_input = torch.stack(
-    #         [torch.nn.functional.pad(f, (0, 0, 0, max_length - f.size(0))) for f in encoder_input_list]
-    #     )
-    #     encoder_length = torch.LongTensor(encoder_length_list).to(encoder_input.device)
-    #     return encoder_input, encoder_length
-
     def inject_perception_input(
         self,
         encoded: Union[torch.Tensor, List[torch.Tensor]],
@@ -359,16 +317,6 @@ class ModularAudioGPTModel(SpeechLLMAdapterMixin, MegatronGPTSFTModel):
             encoder_input = tensor_parallel.mappings.scatter_to_sequence_parallel_region(encoder_input)
 
         return encoder_input, encoder_length, labels, loss_mask, attention_mask, position_ids
-
-    # def _shift_labels_by_emb_len(self, labels, label_lens, emb_lens, max_len, pad_token=0):
-    #     """Shift labels to the right by the length of the audio embeddings."""
-    #     shifted_labels = []
-    #     for label, label_len, emb_len in zip(labels, label_lens, emb_lens):
-    #         shifted_label = torch.full([max_len], pad_token, device=label.device)
-    #         shifted_label[emb_len : emb_len + label_len] = label[:label_len]
-    #         shifted_labels.append(shifted_label)
-    #     shifted_labels = torch.stack(shifted_labels, dim=0)
-    #     return shifted_labels
 
     def _get_text_embeddings(self, text_tokens, position_ids):
         """Get text embeddings for the input text tokens."""
@@ -1608,6 +1556,61 @@ class ModularAudioGPTModel(SpeechLLMAdapterMixin, MegatronGPTSFTModel):
             )
 
         return averaged_loss, averaged_metric
+
+    def generate(
+        self,
+        input_texts: List[str],
+        input_audios: List[str],
+        audio_locator: str,
+        length_params: LengthParam = None,
+        sampling_params: SamplingParam = None,
+        *,
+        strategy: Optional[TextGenerationStrategy] = None,
+    ) -> OutputType:
+
+        # check whether the DDP is initialized
+        if not parallel_state.is_initialized():
+
+            def dummy():
+                return
+
+            if self.trainer.strategy.launcher is not None:
+                self.trainer.strategy.launcher.launch(dummy, trainer=self.trainer)
+            self.trainer.strategy.setup_environment()
+
+            if self.cfg.get('transformer_engine', False):
+                self.setup_transformer_engine_tp_groups()
+                self.setup_transformer_engine_cp_groups()
+
+        # set the default sampling params if it is None.
+        # default do greedy sampling
+        if sampling_params is None:
+            sampling_params = get_default_sampling_params()
+
+        # set the default length params if it is None.
+        # default do greedy sampling
+        if length_params is None:
+            length_params = get_default_length_params()
+
+        strategy_args = {} if strategy is None else {"strategy": strategy}
+
+        return generate(
+            self.cuda(),
+            inputs=[input_texts, input_audios, audio_locator],
+            tokens_to_generate=length_params['max_length'],
+            all_probs=sampling_params['all_probs'],
+            compute_logprob=sampling_params['compute_logprob'],
+            temperature=sampling_params['temperature'],
+            add_BOS=sampling_params['add_BOS'],
+            top_k=sampling_params['top_k'],
+            top_p=sampling_params['top_p'],
+            greedy=sampling_params['use_greedy'],
+            repetition_penalty=sampling_params['repetition_penalty'],
+            end_strings=sampling_params['end_strings'],
+            min_tokens_to_generate=length_params['min_length'],
+            compute_attention_mask=sampling_params.get("compute_attention_mask", True),
+            **strategy_args,
+        )
 
     # consistent with speech models
     @rank_zero_only

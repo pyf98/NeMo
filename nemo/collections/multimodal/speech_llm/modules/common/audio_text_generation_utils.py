@@ -280,7 +280,7 @@ def synced_generate(
 
 def generate(
     model,
-    inputs: Union[Tuple, List[str]],
+    inputs: Union[Tuple, List],
     tokens_to_generate=0,
     all_probs=False,
     temperature=1.0,
@@ -326,13 +326,11 @@ def generate(
     tokenizer = model.tokenizer
     audio_signal, audio_signal_length = None, None
     if torch.distributed.get_rank() == text_generation_utils.get_model_parallel_src_rank():
-        if isinstance(inputs, tuple) and len(inputs) == 2:
-            context_tokens_tensor, context_length_tensor = inputs
-        elif isinstance(inputs, tuple) and len(inputs) == 5:
+        if isinstance(inputs, tuple) and len(inputs) == 5:
             context_tokens_tensor, context_length_tensor, audio_signal, audio_signal_length, audio_locator_ids = inputs
         else:
-            context_tokens_tensor, context_length_tensor = inference_strategy.tokenize_batch(
-                inputs, tokens_to_generate, add_BOS
+            context_tokens_tensor, context_length_tensor, audio_signal, audio_signal_length, audio_locator_ids = inference_strategy.tokenize_batch(
+                inputs, add_BOS
             )
 
         send_generate_info(

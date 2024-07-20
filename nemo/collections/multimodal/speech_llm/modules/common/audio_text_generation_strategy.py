@@ -15,10 +15,13 @@
 from typing import List, Optional, Tuple
 
 import torch
+import librosa
+from lhotse.dataset.collation import collate_vectors as collate_vectors_lhotse
 
 import nemo.collections.nlp.modules.common.text_generation_strategy as text_generation_strategy
 from nemo.collections.multimodal.speech_llm.parts.utils.data_utils import shift_tokens_by_multi_audios
 from nemo.collections.nlp.modules.common.megatron.utils import build_position_ids
+from nemo.collections.nlp.modules.common.lm_utils import pad_batch
 
 # the text representation of eos_id, it applies for all tokenizers
 END_OF_SEQ = '<|endoftext|>'
@@ -157,6 +160,46 @@ class AudioToTextGenerationStrategy(text_generation_strategy.GPTModelTextGenerat
                     any([text.endswith(end_string) for end_string in end_strings] + [p.item() in end_tokens])
                 )
             return torch.tensor(conditions, dtype=torch.bool, device=tokens.device)
+
+    def tokenize_batch(self, inputs, add_BOS):
+        """Tokenize input texts, load input audios, pad them to the same length, and add bos to text if needed.
+
+        Args:
+            inputs (List): input_texts, input_audios, audio_locator
+            add_BOS (bool): whether to add the BOS token at the beginning
+
+        Returns:
+            Tuple[torch.Tensor], context_tokens_tensor, context_length_tensor, audio_signal, audio_signal_length, audio_locator_ids
+        """
+
+        input_texts, input_audios, audio_locator = inputs
+        tokenizer = self.model.tokenizer
+        
+        # tokenize and pad text
+        if add_BOS:
+            context_tokens = [[tokenizer.bos_id] + tokenizer.text_to_ids(s) for s in input_texts]
+        elif hasattr(tokenizer.tokenizer, "get_prefix_tokens"):
+            # chatglm: add tokenizer.gmask_id, tokenizer.sop_id
+            context_tokens = [tokenizer.tokenizer.get_prefix_tokens() + tokenizer.text_to_ids(s) for s in input_texts]
+        else:
+            context_tokens = [tokenizer.text_to_ids(s) for s in input_texts]
+        context_tokens, context_lengths = pad_batch(context_tokens, tokenizer.pad_id, 0)
+        context_tokens_tensor = torch.tensor(context_tokens, dtype=torch.long, device="cuda")
+        context_length_tensor = torch.tensor(context_lengths, dtype=torch.long, device="cuda")
+
+        # load and pad audio
+        sr = self.model.cfg.perception.preprocessor.sample_rate
+        audio_signal = [librosa.load(p, sr=sr)[0] for p in input_audios]
+        audio_signal_length = torch.tensor(
+            [len(audio) for audio in audio_signal], dtype=torch.long, device="cuda"
+        )
+        audio_signal = collate_vectors_lhotse(audio_signal, padding_value=0.).cuda()
+
+        audio_locator_ids = torch.tensor(
+            tokenizer.text_to_ids(audio_locator), dtype=torch.long, device="cuda"
+        )
+
+        return context_tokens_tensor, context_length_tensor, audio_signal, audio_signal_length, audio_locator_ids
 
 
 class CrossAttendAudioToTextGenerationStrategy(AudioToTextGenerationStrategy):
