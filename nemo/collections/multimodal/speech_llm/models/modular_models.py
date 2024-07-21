@@ -129,6 +129,39 @@ class ModularAudioGPTModel(SpeechLLMAdapterMixin, MegatronGPTSFTModel):
 
         return itertools.chain(all_params)
 
+    def setup_learnable_params(self):
+        """Freeze or unfreeze parameters based on model config."""
+        self.unfreeze()
+
+        freeze_llm = self.cfg.get('freeze_llm', True)
+        for param in self.model.parameters():
+            param.requires_grad = not freeze_llm
+
+        if self.cfg.get('freeze_audio_encoder', False):
+            # freeze speaker model if there is any
+            if self.cfg.perception.get("speaker_model", None) is not None:
+                if self.cfg.perception.speaker_model.get("freeze", False):
+                    self.perception.speaker_model.freeze()
+            # freeze other audio encoders
+            if self.cfg.perception.get("encoders", None) is not None:
+                # multiple audio encoders
+                for key, enc_cfg in self.cfg.perception.encoders.items():
+                    if enc_cfg.get("freeze", False):
+                        self.perception.encoders[key].freeze()
+            else:
+                # single audio encoder
+                self.perception.encoder.freeze()
+
+        if self.cfg.get('freeze_modality_adapter', False):
+            # freeze modality adapter
+            self.perception.modality_adapter.freeze()
+
+        for _, module in self.named_modules():
+            if isinstance(module, adapter_mixins.AdapterModuleMixin) and module.is_adapter_available():
+                # add adapters to the optimizer
+                module.set_enabled_adapters(enabled=True)
+                module.unfreeze_enabled_adapters()  # selectively unfreeze the adapter modules.
+
     def setup_optimizer_param_groups(self):
         """
         Override parent method to setup optimizer groups for training/freezing different parts of the model.
@@ -955,7 +988,8 @@ class ModularAudioGPTModel(SpeechLLMAdapterMixin, MegatronGPTSFTModel):
             else:
                 raise ValueError(f"PEFT scheme not not found in PEFT_CONFIG_MAP: {cfg.model.peft.peft_scheme}")
         else:
-            logging.info(f"Running full finetuning since no peft scheme is given.\n{model.summarize()}")
+            logging.info(f"Running full finetuning or freezing LLM since no peft scheme is given.")
+            # logging.info(f"Running full finetuning since no peft scheme is given.\n{model.summarize()}")
 
         # load audio model weights
         if cfg.model.load_audio_encoder:

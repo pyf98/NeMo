@@ -67,6 +67,8 @@ def main(cfg) -> None:
         imported_cls = ModularAudioGPTModel
     model = imported_cls.restore_from_pretrained_models(cfg, trainer=trainer)
 
+    model.setup_learnable_params()
+
     trainer.fit(model)
 
 
