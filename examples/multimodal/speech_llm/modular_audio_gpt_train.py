@@ -68,6 +68,7 @@ def main(cfg) -> None:
     model = imported_cls.restore_from_pretrained_models(cfg, trainer=trainer)
 
     model.setup_learnable_params()
+    logging.info(f"\n************** Model architecture ***********\n{model}\n")
 
     trainer.fit(model)
 
