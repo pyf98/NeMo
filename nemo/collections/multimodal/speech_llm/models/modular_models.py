@@ -129,6 +129,44 @@ class ModularAudioGPTModel(SpeechLLMAdapterMixin, MegatronGPTSFTModel):
 
         return itertools.chain(all_params)
 
+    def configure_sharded_model(self):
+        """Modified from the same method in MegatronBaseModel to include speech encoder and modality adapter."""
+        def find_frozen_submodules(model):
+            frozen_submodules = []
+            frozen_submodule_names = []
+            for name, module in model.named_modules():
+                if (
+                    isinstance(module, torch.nn.Module)
+                    and list(module.parameters())
+                    and all(not param.requires_grad for param in module.parameters())
+                ):
+                    frozen_submodule_names.append(name)
+                    frozen_submodules.append(module)
+            return frozen_submodule_names, frozen_submodules
+
+        if self.use_fsdp:
+            """Top-evel FSDP model sharding"""
+            # Shard the top-level model hierarchically. We shard the strategy-unwrapped model not
+            # to lose the structure of non-FSDP wrapped parameters (e.g, embedding)
+            # TODO: Currently the main parameter data type is kept in fp32 (when O2=False). This needs to be
+            # extended to support lower precision main parameters.
+            frozen_submodule_names, frozen_submodules = find_frozen_submodules(self.model)
+            self.trainer.strategy.kwargs['ignored_states'] = frozen_submodules
+            # NOTE(yifanp): exclude embedding layer to avoid errors in inject_perception_input
+            self.trainer.strategy.kwargs['ignored_states'].append(self.model.embedding)
+            # FSDP requires uniform status of require_grads
+            # Diffusion models like SD has frozen parts and needs to be added to 'ignored_states' from sharding for FSDP to work
+            self.model = self.trainer.strategy._setup_model(self.model)
+            # Move the CPU-initialized model (with `use_cpu_initialization=True`) to GPU, which is to avoid
+            # out-of-memory carash before sharding. In case of GPU-initialized model, this is no-op.
+            self.model = self.model.cuda(torch.cuda.current_device())
+
+            # Shard perception module
+            frozen_submodule_names, frozen_submodules = find_frozen_submodules(self.perception)
+            self.trainer.strategy.kwargs['ignored_states'].extend(frozen_submodules)
+            self.perception = self.trainer.strategy._setup_model(self.perception)
+            self.perception = self.perception.cuda(torch.cuda.current_device())
+
     def setup_learnable_params(self):
         """Freeze or unfreeze parameters based on model config."""
         self.unfreeze()
