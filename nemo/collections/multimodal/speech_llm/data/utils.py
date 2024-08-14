@@ -13,6 +13,8 @@ CODE2LANG = {
 }
 
 CANARY_TEMPLATES = {
+    # "asr": "Repeat the following sentences in <|SLANG|>, <|PNC|>.",
+    # "ast": "Translate the following sentences from <|SLANG|> to <|TLANG|>, <|PNC|>.",
     "asr": "Transcribe the content to <|SLANG|>, <|PNC|>.",
     "ast": "Translate the <|SLANG|> content to <|TLANG|>, <|PNC|>.",
 }
@@ -25,6 +27,8 @@ PNC = {
     "yes": 'with punctuations and capitalizations',
     "no": 'ignoring punctuations and capitalizations',
 }
+PNC[True] = PNC["yes"]
+PNC[False] = PNC["no"]
 
 
 def generate_canary_instruction(entry: dict):
@@ -36,28 +40,34 @@ def generate_canary_instruction(entry: dict):
 
 
 def combine_context_and_instruction(context: str, instruction: str):
-    choices = [
-        f"Given a context:\n{context}\nPerform this task:\n{instruction}",
-        f"Follow the instruction below:\n{instruction}\nYou are given a context:\n{context}",
-        f"Here is a sentence:\n{context}\nYou need to follow:\n{instruction}",
-        f"With the context in mind:\n{context}\nGenerate responses for the instruction:\n{instruction}",
-        f"You need to generate responses to the instruction:\n{instruction}\nYou can use information below:\n{context}",
-        f"{context}\nFollow the instruction below based on the previous sentence:\n{instruction}",
-        f"With the following information:\n{context}\nHow do you respond to the instruction?\n{instruction}",
-        f"Based on the following information:\n{context}\nCan you respond to the instruction?\n{instruction}",
-        f"Can you follow this?\n{instruction}\nYou can find information from:\n{context}",
-        f"You are given some contextual information:\n{context}\nCan you generate a response?\n{instruction}",
-        f"{instruction}\nHere is the context:\n{context}",
-        f"{instruction}\nYou may utilize this text:\n{context}",
-        f"{context}\nCan you perform the following task based on the previous sentence?\n{instruction}",
-        f"Here is your task:\n{instruction}\nYou may find relevant information below:\n{context}",
-        f"Based on this sentence:\n{context}\nCan you respond to the prompt?\n{instruction}",
-        f"{context}\n{instruction}",
-        f"{instruction}\n{context}",
-        f"{context} {instruction}",
-        f"{instruction} {context}",
-    ]
-    return random.choice(choices)
+    # choices = [
+    #     f"Given a context:\n{context}\nPerform this task:\n{instruction}",
+    #     f"Follow the instruction below:\n{instruction}\nYou are given a context:\n{context}",
+    #     f"Here is a sentence:\n{context}\nYou need to follow:\n{instruction}",
+    #     f"With the context in mind:\n{context}\nGenerate responses for the instruction:\n{instruction}",
+    #     f"You need to generate responses to the instruction:\n{instruction}\nYou can use information below:\n{context}",
+    #     f"{context}\nFollow the instruction below based on the previous sentence:\n{instruction}",
+    #     f"With the following information:\n{context}\nHow do you respond to the instruction?\n{instruction}",
+    #     f"Based on the following information:\n{context}\nCan you respond to the instruction?\n{instruction}",
+    #     f"Can you follow this?\n{instruction}\nYou can find information from:\n{context}",
+    #     f"You are given some contextual information:\n{context}\nCan you generate a response?\n{instruction}",
+    #     f"{instruction}\nHere is the context:\n{context}",
+    #     f"{instruction}\nYou may utilize this text:\n{context}",
+    #     f"{context}\nCan you perform the following task based on the previous sentence?\n{instruction}",
+    #     f"Here is your task:\n{instruction}\nYou may find relevant information below:\n{context}",
+    #     f"Based on this sentence:\n{context}\nCan you respond to the prompt?\n{instruction}",
+    #     f"{context}\n{instruction}",
+    #     f"{instruction}\n{context}",
+    #     f"{context} {instruction}",
+    #     f"{instruction} {context}",
+    # ]
+    # sep = "\n" if instruction else ""
+    # choices = [
+    #     # f"{context}{sep}{instruction}",
+    #     f"{instruction}{sep}{context}",
+    # ]
+    # return random.choice(choices)
+    return f"{instruction}\n{context}"
 
 
 def process_manifest_sqa(fin, fout, dataset, label_key="answer"):

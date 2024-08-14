@@ -226,6 +226,26 @@ class LhotseAudioChatDataset(torch.utils.data.Dataset):
                             }
                         ],
                     }
+                elif chat_format == "audio_only":
+                    sft_data = {
+                        "system": "",
+                        "mask": "User",
+                        "dataset": "",
+                        "conversations": [
+                            {
+                                "from": "User",
+                                "value": self.audio_locator,
+                                "canonical_form": "",
+                                "label": None,
+                            },
+                            {
+                                "from": "Assistant",
+                                "value": cut.answer,
+                                "canonical_form": "",
+                                "label": None
+                            }
+                        ],
+                    }
                 elif chat_format == "chat":
                     # data is already in chat format
                     sft_data = {
@@ -234,6 +254,52 @@ class LhotseAudioChatDataset(torch.utils.data.Dataset):
                         "dataset": cut.dataset,
                         "conversations": cut.conversations,
                     }
+                # elif chat_format == "sqa_continuation":
+                #     # audio chat or qa
+                #     sft_data = {
+                #         "system": "",
+                #         "mask": "User",
+                #         "dataset": "",
+                #         "conversations": [
+                #             {
+                #                 "from": "User",
+                #                 "value": f"{cut.question}{self.audio_locator}",
+                #                 "canonical_form": "",
+                #                 "label": None,
+                #             },
+                #             {
+                #                 "from": "Assistant",
+                #                 "value": cut.answer,
+                #                 "canonical_form": "",
+                #                 "label": None
+                #             }
+                #         ],
+                #     }
+                # elif chat_format == "canary_continuation":
+                #     # using a fixed order of context and instruction, same as data generation
+                #     question = (
+                #         "Repeat the following words." if cut.source_lang == cut.target_lang
+                #         else f"Translate the following text into {CODE2LANG[cut.target_lang]} text."
+                #     )
+                #     sft_data = {
+                #         "system": "",
+                #         "mask": "User",
+                #         "dataset": "",
+                #         "conversations": [
+                #             {
+                #                 "from": "User",
+                #                 "value": f"{question} {self.audio_locator}",
+                #                 "canonical_form": "",
+                #                 "label": None,
+                #             },
+                #             {
+                #                 "from": "Assistant",
+                #                 "value": cut.answer,
+                #                 "canonical_form": "",
+                #                 "label": None
+                #             }
+                #         ],
+                #     }
                 else:
                     raise NotImplementedError(f"Chat format {chat_format} is not supported.")
 
