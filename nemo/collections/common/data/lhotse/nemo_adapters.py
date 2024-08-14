@@ -284,10 +284,15 @@ class LazyNeMoTarredIterator:
             tar_path = self.shard_id_to_tar_path[sid]
             with tarfile.open(fileobj=open_best(tar_path, mode="rb"), mode="r|*") as tar:
                 for tar_info in tar:
-                    assert tar_info.name in shard_manifest, (
-                        f"Mismatched entry between JSON manifest ('{manifest_path}') and tar file ('{tar_path}'). "
-                        f"Cannot locate JSON entry for tar file '{tar_info.name}'"
-                    )
+                    # assert tar_info.name in shard_manifest, (
+                    #     f"Mismatched entry between JSON manifest ('{manifest_path}') and tar file ('{tar_path}'). "
+                    #     f"Cannot locate JSON entry for tar file '{tar_info.name}'"
+                    # )
+
+                    # NOTE(yifanp): skip entries that do not exist in manifest
+                    if tar_info.name not in shard_manifest:
+                        continue
+
                     data = shard_manifest[tar_info.name]
                     raw_audio = tar.extractfile(tar_info).read()
                     # Note: Lhotse has a Recording.from_bytes() utility that we won't use here because
