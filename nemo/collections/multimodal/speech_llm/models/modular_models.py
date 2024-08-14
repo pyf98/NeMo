@@ -1138,7 +1138,7 @@ class ModularAudioGPTModel(SpeechLLMAdapterMixin, MegatronGPTSFTModel):
                 peft_cfg_cls = PEFT_CONFIG_MAP[model_cfg.peft.peft_scheme]
                 model.load_adapters(cfg.model.peft.restore_from_path, peft_cfg_cls(model_cfg), map_location="cpu")
             else:
-                torch_state_dict = torch.load(cfg.model.peft.restore_from_path)['state_dict']
+                torch_state_dict = torch.load(cfg.model.peft.restore_from_path, map_location="cpu")['state_dict']
                 model.load_state_dict(torch_state_dict, strict=False)
         elif cfg.model.peft.restore_from_ckpt.checkpoint_dir and cfg.model.peft.restore_from_ckpt.checkpoint_name:
             checkpoint_path = os.path.join(
