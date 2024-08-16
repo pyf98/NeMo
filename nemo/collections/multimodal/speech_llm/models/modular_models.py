@@ -298,9 +298,18 @@ class ModularAudioGPTModel(SpeechLLMAdapterMixin, MegatronGPTSFTModel):
     ):
         """Inject audio features into the text input and return the final input embeddings to LLM."""
 
-        lm_embedding = (
-            self.model.language_model.embedding if hasattr(self.model, 'language_model') else self.model.embedding
-        )
+        if hasattr(self.model, 'language_model'):
+            lm_embedding = self.model.language_model.embedding
+        elif hasattr(self.model, 'embedding'):
+            lm_embedding = self.model.embedding
+        elif hasattr(self.model, 'module') and hasattr(self.model.module, "embedding"):
+            lm_embedding = self.model.module.embedding
+        else:
+            raise NotImplementedError("Failed to get lm embedding")
+
+        # lm_embedding = (
+        #     self.model.language_model.embedding if hasattr(self.model, 'language_model') else self.model.embedding
+        # )
         input_embeds = lm_embedding.word_embeddings(input_ids)  # [b, t, c]
 
         PAD_ID = self.tokenizer.pad_id
@@ -391,9 +400,19 @@ class ModularAudioGPTModel(SpeechLLMAdapterMixin, MegatronGPTSFTModel):
 
     def _get_text_embeddings(self, text_tokens, position_ids):
         """Get text embeddings for the input text tokens."""
-        lm_embedding = (
-            self.model.language_model.embedding if hasattr(self.model, 'language_model') else self.model.embedding
-        )
+        # lm_embedding = (
+        #     self.model.language_model.embedding if hasattr(self.model, 'language_model') else self.model.embedding
+        # )
+
+        if hasattr(self.model, 'language_model'):
+            lm_embedding = self.model.language_model.embedding
+        elif hasattr(self.model, 'embedding'):
+            lm_embedding = self.model.embedding
+        elif hasattr(self.model, 'module') and hasattr(self.model.module, "embedding"):
+            lm_embedding = self.model.module.embedding
+        else:
+            raise NotImplementedError("Failed to get lm embedding")
+
         text_embeddings = lm_embedding.word_embeddings(text_tokens)  # (batch_size, seq_len, hidden_size)
         if hasattr(lm_embedding, 'position_embeddings'):
             position_embeddings = lm_embedding.position_embeddings(position_ids)
@@ -469,6 +488,11 @@ class ModularAudioGPTModel(SpeechLLMAdapterMixin, MegatronGPTSFTModel):
         multimodal_output = {}
         if 'audio_signal' in audio_batch:
             encoder_input, attention_mask, labels, loss_mask, _ = self.prepare_llm_input(audio_batch)
+
+            # NOTE(yifanp): convert dtype to match LLM; assuming bf16 is used
+            if self.cfg.megatron_amp_O2:
+                encoder_input = encoder_input.to(torch.bfloat16)
+
             output = self._gpt_forward(
                 None, None, encoder_input, attention_mask, labels, checkpoint_activations_all_layers
             )
@@ -657,6 +681,10 @@ class ModularAudioGPTModel(SpeechLLMAdapterMixin, MegatronGPTSFTModel):
                 and isinstance(model.module, MCoreGPTModel)
             ):
                 attention_mask = None
+
+            # NOTE(yifan): assuming bf16
+            if self.cfg.megatron_amp_O2:
+                input_embeddings = input_embeddings.to(torch.bfloat16)
 
             output_tensor = model(
                 input_ids=None,
@@ -1332,6 +1360,10 @@ class ModularAudioGPTModel(SpeechLLMAdapterMixin, MegatronGPTSFTModel):
             self.tokenizer.ids_to_text(t[l.item() :][: data_cfg.get('tokens_to_generate')])
             for t, l in zip(output['token_ids'], batch['encoder_length'])
         ]
+
+        # NOTE(yifanp): manually remove <|finetune_right_pad_id|> for llama models
+        inputs_text = [x.replace("<|finetune_right_pad_id|>", "") for x in inputs_text]
+        labels_text = [x.replace("<|finetune_right_pad_id|>", "") for x in labels_text]
 
         if data_cfg.get("end_string", None):
             # sometimes data_cfg.end_string != self.tokenizer.ids_to_text(self.tokenizer.text_to_ids(data_cfg.end_string))

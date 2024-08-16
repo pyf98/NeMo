@@ -229,7 +229,9 @@ class AutoTokenizer(TokenizerSpec):
     @property
     def pad_id(self):
         if getattr(self, 'pad_token') is None:
-            return None
+            ## llama3.1
+            pad_id = self.tokenizer.convert_tokens_to_ids("<|finetune_right_pad_id|>")  # will be None if this is not a token
+            return pad_id
         return self.tokens_to_ids([getattr(self, 'pad_token')])[0]
 
     @property
