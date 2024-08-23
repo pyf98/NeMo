@@ -45,7 +45,7 @@ def torch_dtype_from_precision(precision: Union[int, str], megatron_amp_O2: Opti
     if megatron_amp_O2 is not None and megatron_amp_O2 is False:
         return torch.float32
 
-    if precision in ['bf16', 'bf16-mixed']:
+    if precision in ['bf16', 'bf16-mixed', 'bf16-true']:
         return torch.bfloat16
     elif precision in [16, '16', '16-mixed']:
         return torch.float16

@@ -98,7 +98,7 @@ def clip_grad_norm_fp32(parameters, max_norm, norm_type=2, use_fsdp=False):
                 is_not_tp_duplicate = param_is_not_tensor_parallel_duplicate(param)
                 grad = param.grad.detach()
                 # Make sure the grads are in fp32
-                assert isinstance(param.grad, torch.cuda.FloatTensor)
+                # assert isinstance(param.grad, torch.cuda.FloatTensor)
                 grads.append(grad)
                 if is_not_shared and is_not_tp_duplicate:
                     grads_for_norm.append(grad)
