@@ -46,12 +46,15 @@ class AudioToTextGenerationStrategy(text_generation_strategy.GPTModelTextGenerat
     ):
         """initialize the batch data before the inference steps."""
 
-        audio_feats, audio_feat_lens = self.model.perception(
-            input_signal=audio_signal,
-            input_signal_length=audio_length,
-            processed_signal=None,
-            processed_signal_length=None,
-        )
+        if audio_signal.size(0):
+            audio_feats, audio_feat_lens = self.model.perception(
+                input_signal=audio_signal,
+                input_signal_length=audio_length,
+                processed_signal=None,
+                processed_signal_length=None,
+            )
+        else:
+            audio_feats, audio_feat_lens = [], []
 
         encoder_input, encoder_length, labels, loss_mask, attention_mask, position_ids = self.model.inject_perception_input(
             encoded=audio_feats,
@@ -174,7 +177,7 @@ class AudioToTextGenerationStrategy(text_generation_strategy.GPTModelTextGenerat
 
         input_texts, input_audios, audio_locator = inputs
         tokenizer = self.model.tokenizer
-        
+
         # tokenize and pad text
         if add_BOS:
             context_tokens = [[tokenizer.bos_id] + tokenizer.text_to_ids(s) for s in input_texts]
@@ -193,7 +196,10 @@ class AudioToTextGenerationStrategy(text_generation_strategy.GPTModelTextGenerat
         audio_signal_length = torch.tensor(
             [len(audio) for audio in audio_signal], dtype=torch.long, device="cuda"
         )
-        audio_signal = collate_vectors_lhotse(audio_signal, padding_value=0.).cuda()
+        if audio_signal:
+            audio_signal = collate_vectors_lhotse(audio_signal, padding_value=0.).cuda()
+        else:
+            audio_signal = torch.tensor([]).cuda()
 
         audio_locator_ids = torch.tensor(
             tokenizer.text_to_ids(audio_locator), dtype=torch.long, device="cuda"

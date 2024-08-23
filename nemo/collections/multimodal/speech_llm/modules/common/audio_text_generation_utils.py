@@ -80,7 +80,7 @@ def send_generate_info(
     model_parallel_group = parallel_state.get_model_parallel_group()
     src = text_generation_utils.get_model_parallel_src_rank()
 
-    audio_max_len = audio_signal.size(1) if audio_signal is not None else 0
+    audio_max_len = audio_signal.size(1) if audio_signal.size(0) else 0
 
     # Send the sizes of the tensors
     input_info = [
@@ -108,6 +108,8 @@ def send_generate_info(
     torch.distributed.broadcast(audio_signal, src, model_parallel_group)
     torch.distributed.broadcast(audio_signal_length, src, model_parallel_group)
     torch.distributed.broadcast(audio_locator_ids, src, model_parallel_group)
+
+    print(f"Sent: {audio_signal.shape}")
 
     # send end strings
     string_tensor = torch.as_tensor(
@@ -153,6 +155,8 @@ def receive_generate_info():
     torch.distributed.broadcast(audio_signal, src, model_parallel_group)
     torch.distributed.broadcast(audio_signal_length, src, model_parallel_group)
     torch.distributed.broadcast(audio_locator_ids, src, model_parallel_group)
+
+    print(f"Received: {audio_signal.shape}")
 
     array_size = torch.empty(1, dtype=torch.int64, device=torch.cuda.current_device())
     torch.distributed.broadcast(array_size, src, model_parallel_group)
