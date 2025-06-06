@@ -38,13 +38,13 @@ from nemo.collections.speechlm2.parts.hf_hub import HFHubMixin
 from nemo.collections.speechlm2.parts.lora import maybe_install_lora
 from nemo.collections.speechlm2.parts.metrics.asr_bleu import ASRBLEU
 from nemo.collections.speechlm2.parts.metrics.bleu import BLEU
+from nemo.collections.speechlm2.parts.metrics.mos import MOS
 from nemo.collections.speechlm2.parts.optim_setup import configure_optimizers, is_frozen
 from nemo.collections.speechlm2.parts.precision import fp32_precision
 from nemo.collections.speechlm2.parts.pretrained import load_pretrained_hf, setup_audio_codec, setup_speech_encoder
 from nemo.core.neural_types import AudioSignal, LabelsType, LengthsType, NeuralType
 from nemo.utils import logging
 import os
-import torch.distributed as dist
 import torchaudio
 
 class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
@@ -332,6 +332,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         self.on_train_epoch_start()
         self.asr_bleu = ASRBLEU(self.cfg.scoring_asr).reset()
         self.bleu = BLEU().reset()
+        self.mos = MOS().reset()
 
     def on_validation_epoch_end(self, prefix="val") -> None:
         asr_bleu = self.asr_bleu.compute()
@@ -340,9 +341,13 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         bleu = self.bleu.compute()
         for k, m in bleu.items():
             self.log(f"{prefix}_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
+        mos = self.mos.compute()
+        for k, m in mos.items():
+            self.log(f"{prefix}_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
 
     def validation_step(self, batch: dict, batch_idx: int):
         for name, dataset_batch in batch.items():
+
             if dataset_batch is None:
                 continue  # some dataset is exhausted
 
@@ -351,34 +356,47 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                 dataset_batch["source_audio_lens"],
             )
 
-            if self.cfg.get('audio_save_path') is not None and dist.get_rank() == 0:
-                os.makedirs(self.cfg.get('audio_save_path'), exist_ok=True)
-                for i in range(len(results["audio"])):
-                    pred_audio = torchaudio.functional.resample(results["audio"][i].float(), 22050, 16000)
-                    user_audio = dataset_batch["source_audio"][i]
 
-                    T1, T2 = pred_audio.shape[0], user_audio.shape[0]
-                    max_len = max(T1, T2)
-                    pred_audio_padded = torch.nn.functional.pad(pred_audio, (0, max_len - T1), mode='constant', value=0)
-                    user_audio_padded = torch.nn.functional.pad(user_audio, (0, max_len - T2), mode='constant', value=0)
+            with fp32_precision():
+                pred_audios = resample(results["audio"], 22050, 16000)
 
-                    result_audio = pred_audio_padded + user_audio_padded
 
-                    torchaudio.save(f"{self.cfg.audio_save_path}/{name}_{dataset_batch['sample_id'][i]}.wav",
-                                    result_audio.unsqueeze(0).float().cpu(),
-                                    16000)
+            if self.cfg.get('audio_save_path') is not None:
+                self.save_predicted_audio(pred_audios, dataset_batch, name)
 
-            dist.barrier()
+            self.mos.update(
+                name=name,
+                pred_audios=pred_audios,
+                tmp_dir=os.path.join(self.cfg.get('audio_save_path'), "tmp"),
+            )
 
-            with fp32_precision():  # resample is fragile to bfloat16 default dtype
-                self.asr_bleu.update(
-                    name=name,
-                    refs=dataset_batch["target_texts"],
-                    pred_audio=resample(results["audio"], 22050, 16000),
-                    pred_audio_lens=(results["audio_len"] / 22050 * 16000).to(torch.long),
-                )
+            self.asr_bleu.update(
+                name=name,
+                refs=dataset_batch["target_texts"],
+                pred_audio=pred_audios,
+                pred_audio_lens=(results["audio_len"] / 22050 * 16000).to(torch.long),
+            )
 
             self.bleu.update(name=name, refs=dataset_batch["target_texts"], hyps=results["text"])
+
+    def save_predicted_audio(self, pred_audios, dataset_batch, name):
+
+        save_path = os.path.join(self.cfg.get('audio_save_path'), name)
+        os.makedirs(save_path, exist_ok=True)
+        for i in range(len(pred_audios)):
+            pred_audio = pred_audios[i]
+            user_audio =  dataset_batch["source_audio"][i]
+            T1, T2 = pred_audio.shape[0], user_audio.shape[0]
+            max_len = max(T1, T2)
+            pred_audio_padded = torch.nn.functional.pad(pred_audio, (0, max_len - T1), mode='constant', value=0)
+            user_audio_padded = torch.nn.functional.pad(user_audio, (0, max_len - T2), mode='constant', value=0)
+            result_audio = pred_audio_padded + user_audio_padded
+            if len(dataset_batch['sample_id'][0]) == 0:
+                dataset_batch['sample_id'][0] = dataset_batch['target_texts'][0][:6]
+            torchaudio.save(f"{self.cfg.audio_save_path}/{name}/{dataset_batch['sample_id'][i]}.wav",
+                            result_audio.unsqueeze(0).float().cpu(),
+                            16000)
+
 
     def on_test_epoch_start(self) -> None:
         return self.on_validation_epoch_start()
