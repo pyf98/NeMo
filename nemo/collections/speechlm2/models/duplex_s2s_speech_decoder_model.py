@@ -43,7 +43,9 @@ from nemo.collections.speechlm2.parts.precision import fp32_precision
 from nemo.collections.speechlm2.parts.pretrained import load_pretrained_hf, setup_audio_codec, setup_speech_encoder
 from nemo.core.neural_types import AudioSignal, LabelsType, LengthsType, NeuralType
 from nemo.utils import logging
-
+import os
+import torch.distributed as dist
+import torchaudio
 
 class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
     def __init__(self, cfg: dict) -> None:
@@ -348,6 +350,25 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                 dataset_batch["source_audio"],
                 dataset_batch["source_audio_lens"],
             )
+
+            if self.cfg.get('audio_save_path') is not None and dist.get_rank() == 0:
+                os.makedirs(self.cfg.get('audio_save_path'), exist_ok=True)
+                for i in range(len(results["audio"])):
+                    pred_audio = torchaudio.functional.resample(results["audio"][i].float(), 22050, 16000)
+                    user_audio = dataset_batch["source_audio"][i]
+
+                    T1, T2 = pred_audio.shape[0], user_audio.shape[0]
+                    max_len = max(T1, T2)
+                    pred_audio_padded = torch.nn.functional.pad(pred_audio, (0, max_len - T1), mode='constant', value=0)
+                    user_audio_padded = torch.nn.functional.pad(user_audio, (0, max_len - T2), mode='constant', value=0)
+
+                    result_audio = pred_audio_padded + user_audio_padded
+
+                    torchaudio.save(f"{self.cfg.audio_save_path}/{name}_{dataset_batch['sample_id'][i]}.wav",
+                                    result_audio.unsqueeze(0).float().cpu(),
+                                    16000)
+
+            dist.barrier()
 
             with fp32_precision():  # resample is fragile to bfloat16 default dtype
                 self.asr_bleu.update(

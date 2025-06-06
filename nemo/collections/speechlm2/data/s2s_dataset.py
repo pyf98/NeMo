@@ -112,6 +112,7 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
             cuts, self.tokenizer, self.frame_length, roles=self.input_roles
         )
         return {
+            "sample_id": [" ".join(s.id for s in cut.supervisions if s.speaker in ["user"]) for cut in cuts],
             "source_audio": source_audio,
             "source_audio_lens": source_audio_lens,
             "target_audio": target_audio,
