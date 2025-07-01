@@ -301,48 +301,82 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         for m in (self.perception.preprocessor, self.perception.encoder, self.llm, self.speech_generation):
             if is_frozen(m):
                 m.eval()
-        inputs = self.prepare_inputs(batch)
-        forward_outputs = self(
-            inputs["input_embeds"],
-            input_audio_tokens=inputs["input_audio_tokens"],
-            text_label=inputs['text_labels'],
-            loss_mask=inputs["loss_mask"],
-        )
-        num_frames = inputs["input_lens"].sum()
-        with loss_parallel():
-            text_loss = (
-                torch.nn.functional.cross_entropy(
-                    forward_outputs["text_logits"].flatten(0, 1),  # (B, T, Vt) -> (*, Vt)
-                    inputs["text_labels"].flatten(0, 1),
-                    reduction="sum",
-                )
-                / num_frames
-            )
-            audio_loss = torch.nn.functional.cross_entropy(
-                forward_outputs["audio_logits"].flatten(0, 2),  # (B, T, K, Vs) -> (*, Vs)
-                inputs["audio_labels"].flatten(0, 2),
-                reduction="sum",
-            ) / (num_frames * self._num_codebooks)
-        loss = self.cfg.text_loss_weight * text_loss + self.cfg.audio_loss_weight * audio_loss
 
-        # text_acc = self.cal_token_acc(forward_outputs["text_logits"].flatten(0, 1), inputs["text_labels"].flatten(0, 1), 0 )
-        # audio_acc = self.cal_token_acc(forward_outputs["audio_logits"].flatten(0, 1), inputs["audio_labels"].flatten(0, 1), -1)
-
-        B, T = inputs["input_embeds"].shape[:2]
-        ans = {
-            "loss": loss,
+        res = {
             "learning_rate": (
                 torch.as_tensor(self.trainer.optimizers[0].param_groups[0]['lr'] if self._trainer is not None else 0)
             ),
-            "text_loss": text_loss,
-            "audio_loss": audio_loss,
-            "batch_size": B,
-            "sequence_length": T,
-            "num_frames": num_frames.to(torch.float32),  # avoid warning
-            "padding_ratio": num_frames / (B * T),
         }
-        self.log_dict(ans, on_step=True)
-        return ans
+
+        if batch["audio_data"] is not None:
+            inputs = self.prepare_inputs(batch["audio_data"])
+            forward_outputs = self(
+                inputs["input_embeds"],
+                input_audio_tokens=inputs["input_audio_tokens"],
+                text_label=inputs['text_labels'],
+                loss_mask=inputs["loss_mask"],
+            )
+            num_frames = inputs["input_lens"].sum()
+            with loss_parallel():
+                text_loss = (
+                    torch.nn.functional.cross_entropy(
+                        forward_outputs["text_logits"].flatten(0, 1),  # (B, T, Vt) -> (*, Vt)
+                        inputs["text_labels"].flatten(0, 1),
+                        reduction="sum",
+                    )
+                    / num_frames
+                )
+                audio_loss = torch.nn.functional.cross_entropy(
+                    forward_outputs["audio_logits"].flatten(0, 2),  # (B, T, K, Vs) -> (*, Vs)
+                    inputs["audio_labels"].flatten(0, 2),
+                    reduction="sum",
+                ) / (num_frames * self._num_codebooks)
+            loss = self.cfg.text_loss_weight * text_loss + self.cfg.audio_loss_weight * audio_loss
+
+            # text_acc = self.cal_token_acc(forward_outputs["text_logits"].flatten(0, 1), inputs["text_labels"].flatten(0, 1), 0 )
+            # audio_acc = self.cal_token_acc(forward_outputs["audio_logits"].flatten(0, 1), inputs["audio_labels"].flatten(0, 1), -1)
+
+            B, T = inputs["input_embeds"].shape[:2]
+            ans = {
+                "audio_loss": loss,
+                "audio_to_text_loss": text_loss,
+                "audio_to_audio_loss": audio_loss,
+                "audio_batch_size": B,
+                "audio_sequence_length": T,
+                "audio_num_frames": num_frames.to(torch.float32),  # avoid warning
+                "audio_padding_ratio": num_frames / (B * T),
+            }
+            res.update(ans)
+
+        if batch["text_data"] is not None:
+            text_input_ids = batch["text_data"]["text_tokens"][:, :-1]
+            text_target = batch["text_data"]["text_tokens"][:, 1:]
+
+            text_out = self.llm(
+                inputs_embeds=self.embed_tokens(text_input_ids),
+                past_key_values=None,
+                use_cache=False,
+                return_dict=True,
+            )
+            text_logits = self.lm_head(text_out['last_hidden_state'])  # (B, T, Vt)
+
+            text_loss = torch.nn.functional.cross_entropy(
+                text_logits.flatten(0, 1),  # (B, T, Vt) -> (*, Vt)
+                text_target.flatten(0, 1),
+                ignore_index=self.text_pad_id,
+            )
+            res.update(
+                {
+                    "text_to_text_loss": text_loss,
+                    "text_batch_size": text_input_ids.shape[0],
+                    "text_sequence_length": text_input_ids.shape[1],
+                }
+            )
+
+        res["loss"] = (1. - self.cfg.text_to_text_loss_weight) * res.get("audio_loss", 0.0) + \
+            self.cfg.text_to_text_loss_weight * res.get("text_to_text_loss", 0.0)
+        self.log_dict(res, on_step=True)
+        return res
 
     def on_train_epoch_start(self) -> None:
         setup_audio_codec(self)  # potentially reloads the audio codec to make sure it's in fp32
@@ -372,6 +406,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             if dataset_batch is None:
                 continue  # some dataset is exhausted
 
+            dataset_batch = dataset_batch["audio_data"]
 
             results = self.offline_inference(
                 dataset_batch["source_audio"],
@@ -426,6 +461,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             if not sample_id:
                 sample_id = dataset_batch['target_texts'][i][:15].replace(" ", "_")
 
+            sample_id = sample_id.replace("/", "_")
             save_filename = os.path.join(save_path, f"{sample_id}.wav")
 
             torchaudio.save(

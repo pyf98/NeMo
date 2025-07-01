@@ -21,6 +21,7 @@ from lhotse.dataset.collation import collate_audio, collate_vectors
 from lhotse.utils import ifnone
 
 from nemo.collections.common.tokenizers import TokenizerSpec
+from nemo.collections.common.data.lhotse.text_adapters import Formattable
 from nemo.collections.speechlm2.data.utils import get_pad_id
 from nemo.utils import logging
 
@@ -88,6 +89,7 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
         target_sample_rate: int,
         input_roles: list[str] = None,
         output_roles: list[str] = None,
+        text_max_tokens: int = 2048,
     ):
         self.tokenizer = tokenizer
         self.frame_length = frame_length
@@ -95,35 +97,72 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
         self.target_sample_rate = target_sample_rate
         self.input_roles = set(ifnone(input_roles, ["user"]))
         self.output_roles = set(ifnone(output_roles, ["agent"]))
+        self.text_max_tokens = text_max_tokens
 
         assert tokenizer.bos is not None, "BOS support in the tokenizer is required for S2S models."
         assert tokenizer.eos is not None, "EOS support in the tokenizer is required for S2S models."
 
-    def __getitem__(self, cuts: CutSet) -> dict:
-        cuts = cuts.transform_text(_strip_timestamps)
-        source_audio, source_audio_lens = collate_audio(cuts.resample(self.source_sample_rate))
-        target_audio, target_audio_lens = collate_audio(
-            cuts.resample(self.target_sample_rate), recording_field="target_audio"
-        )
-        target_tokens, target_token_lens = collate_token_channel(
-            cuts, self.tokenizer, self.frame_length, roles=self.output_roles
-        )
-        source_tokens, source_token_lens = collate_token_channel(
-            cuts, self.tokenizer, self.frame_length, roles=self.input_roles
-        )
+    def __getitem__(self, all_cuts: CutSet) -> dict:
+        # audio mini-batch
+        cuts = all_cuts.filter(lambda c: isinstance(c, Cut))
+        audio_data = None
+        if cuts:
+            cuts = cuts.transform_text(_strip_timestamps)
+            source_audio, source_audio_lens = collate_audio(cuts.resample(self.source_sample_rate))
+            target_audio, target_audio_lens = collate_audio(
+                cuts.resample(self.target_sample_rate), recording_field="target_audio"
+            )
+            target_tokens, target_token_lens = collate_token_channel(
+                cuts, self.tokenizer, self.frame_length, roles=self.output_roles
+            )
+            source_tokens, source_token_lens = collate_token_channel(
+                cuts, self.tokenizer, self.frame_length, roles=self.input_roles
+            )
+            audio_data = {
+                "sample_id": [" ".join(s.id for s in cut.supervisions if s.speaker in ["user"]) for cut in cuts],
+                "source_audio": source_audio,
+                "source_audio_lens": source_audio_lens,
+                "target_audio": target_audio,
+                "target_audio_lens": target_audio_lens,
+                "target_tokens": target_tokens,
+                "target_token_lens": target_token_lens,
+                "source_tokens": source_tokens,
+                "source_token_lens": source_token_lens,
+                "target_texts": [
+                    " ".join(s.text for s in cut.supervisions if s.speaker in self.output_roles) for cut in cuts
+                ],
+            }
+
+        # text mini-batch
+        text_cuts = all_cuts.filter(lambda c: isinstance(c, Formattable))
+        text_data = None
+        if text_cuts:
+            text_tokens = []
+            text_token_lens = []
+            for c in text_cuts:
+                if c.input_ids.shape[0] > self.text_max_tokens:
+                    # randomly select a segment of input_ids
+                    start = torch.randint(0, c.input_ids.shape[0] - self.text_max_tokens + 1, (1,)).item()
+                    end = start + self.text_max_tokens
+                    text_ids = c.input_ids[start:end]
+                else:
+                    text_ids = c.input_ids
+
+                text_tokens.append(text_ids)
+                text_token_lens.append(text_ids.shape[0])
+
+            text_tokens = collate_vectors(
+                text_tokens, padding_value=get_pad_id(self.tokenizer)
+            )
+            text_token_lens = torch.tensor(text_token_lens, dtype=torch.long)
+            text_data = {
+                "text_tokens": text_tokens,
+                "text_token_lens": text_token_lens,
+            }
+
         return {
-            "sample_id": [cut.id for cut in cuts],
-            "source_audio": source_audio,
-            "source_audio_lens": source_audio_lens,
-            "target_audio": target_audio,
-            "target_audio_lens": target_audio_lens,
-            "target_tokens": target_tokens,
-            "target_token_lens": target_token_lens,
-            "source_tokens": source_tokens,
-            "source_token_lens": source_token_lens,
-            "target_texts": [
-                " ".join(s.text for s in cut.supervisions if s.speaker in self.output_roles) for cut in cuts
-            ],
+            "audio_data": audio_data,
+            "text_data": text_data,
         }
 
 

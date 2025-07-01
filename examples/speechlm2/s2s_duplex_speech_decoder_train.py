@@ -15,6 +15,7 @@ import os
 
 import torch
 from lightning.pytorch import Trainer
+from lightning.pytorch.callbacks import ModelCheckpoint
 from omegaconf import OmegaConf
 
 from nemo.collections.speechlm2 import DataModule, DuplexS2SDataset, DuplexS2SSpeechDecoderModel
@@ -35,6 +36,11 @@ def train(cfg):
     log_dir = exp_manager(trainer, cfg.get("exp_manager", None))
     OmegaConf.save(cfg, log_dir / "exp_config.yaml")
 
+    # avoid using `=` in the checkpoint name
+    for callback in trainer.callbacks:
+        if isinstance(callback, ModelCheckpoint):
+            callback.CHECKPOINT_EQUALS_CHAR = "-"
+
     with trainer.init_module():
         model = DuplexS2SSpeechDecoderModel(OmegaConf.to_container(cfg.model, resolve=True))
 
@@ -45,6 +51,7 @@ def train(cfg):
         target_sample_rate=cfg.data.target_sample_rate,
         input_roles=cfg.data.input_roles,
         output_roles=cfg.data.output_roles,
+        text_max_tokens=cfg.data.text_max_tokens,
     )
     datamodule = DataModule(cfg.data, tokenizer=model.tokenizer, dataset=dataset)
 
