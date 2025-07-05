@@ -65,7 +65,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         # pretrained LM head weights.
         # However, for S2S we need to access the activations before LM head directly
         # to feed them to the audio codec head.
-        self.tokenizer = AutoTokenizer(self.cfg.pretrained_llm, use_fast=True)
+        self.tokenizer = AutoTokenizer(self.cfg.pretrained_llm, use_fast=True, **self.cfg.get("override_tokens", {}))
         llm = load_pretrained_hf(self.cfg.pretrained_llm, pretrained_weights=self.cfg.pretrained_weights).train()
         self.llm = llm.model  # fetch PretrainedBaseModel from model "ForCausalLM"
         self.lm_head = llm.lm_head
@@ -287,6 +287,16 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             dtype=torch.bool,
         )
 
+        if self.cfg.get("mask_sequence_padding", True):
+            # set the mask based on the target_token_lens to disconsider sequence padding in loss
+            for i in range(batch["target_token_lens"].size(0)):
+                speech_end_idx = batch["target_token_lens"][i]
+                loss_mask[i, speech_end_idx:, :] = 0
+
+            # check new mask consistency
+            mask_lengths = loss_mask[:, :, 0].sum(-1)
+            assert torch.allclose(batch["target_token_lens"].float(), mask_lengths.float(), atol=2.0)
+
         return {
             "input_embeds": input_embeds,
             "input_lens": source_encoded_lens - 1,
@@ -317,20 +327,34 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                 loss_mask=inputs["loss_mask"],
             )
             num_frames = inputs["input_lens"].sum()
+
             with loss_parallel():
+                # custom token loss weight
+                text_token_loss_weight = torch.ones(forward_outputs["text_logits"].shape[-1], device=self.device)
+                text_token_loss_weight[self.text_bos_id] = self.cfg.get("token_loss_weight", {}).get("bos", 1.0)
+                text_token_loss_weight[self.text_eos_id] = self.cfg.get("token_loss_weight", {}).get("eos", 1.0)
+                text_token_loss_weight[self.text_pad_id] = self.cfg.get("token_loss_weight", {}).get("pad", 1.0)
+
+                # mask the loss based on the loss_mask for text channel
+                text_loss_mask = inputs["loss_mask"][:, :, 0].flatten(0, 1)
                 text_loss = (
                     torch.nn.functional.cross_entropy(
                         forward_outputs["text_logits"].flatten(0, 1),  # (B, T, Vt) -> (*, Vt)
-                        inputs["text_labels"].flatten(0, 1),
-                        reduction="sum",
-                    )
-                    / num_frames
-                )
-                audio_loss = torch.nn.functional.cross_entropy(
-                    forward_outputs["audio_logits"].flatten(0, 2),  # (B, T, K, Vs) -> (*, Vs)
-                    inputs["audio_labels"].flatten(0, 2),
-                    reduction="sum",
-                ) / (num_frames * self._num_codebooks)
+                        inputs["text_labels"].flatten(0, 1),  # (B, T) -> (*,)
+                        weight=text_token_loss_weight,
+                        reduction="none",
+                    ) * text_loss_mask
+                ).sum() / text_loss_mask.sum()
+
+                audio_loss_mask = inputs["loss_mask"][:, :, 1:].flatten(0, 2)
+                audio_loss = (
+                    torch.nn.functional.cross_entropy(
+                        forward_outputs["audio_logits"].flatten(0, 2),  # (B, T, K, Vs) -> (*, Vs)
+                        inputs["audio_labels"].flatten(0, 2),
+                        reduction="none",
+                    ) * audio_loss_mask
+                ).sum() / audio_loss_mask.sum()
+
             loss = self.cfg.text_loss_weight * text_loss + self.cfg.audio_loss_weight * audio_loss
 
             # text_acc = self.cal_token_acc(forward_outputs["text_logits"].flatten(0, 1), inputs["text_labels"].flatten(0, 1), 0 )
