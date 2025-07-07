@@ -89,7 +89,7 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
         target_sample_rate: int,
         input_roles: list[str] = None,
         output_roles: list[str] = None,
-        text_max_tokens: int = 2048,
+        text_max_tokens: int = 10000,
     ):
         self.tokenizer = tokenizer
         self.frame_length = frame_length
@@ -142,9 +142,10 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
             for c in text_cuts:
                 if c.input_ids.shape[0] > self.text_max_tokens:
                     # randomly select a segment of input_ids
-                    start = torch.randint(0, c.input_ids.shape[0] - self.text_max_tokens + 1, (1,)).item()
-                    end = start + self.text_max_tokens
-                    text_ids = c.input_ids[start:end]
+                    # start = torch.randint(0, c.input_ids.shape[0] - self.text_max_tokens + 1, (1,)).item()
+                    # end = start + self.text_max_tokens
+                    # text_ids = c.input_ids[start:end]
+                    raise RuntimeError(f"Text too long: {c.input_ids.shape[0]} > {self.text_max_tokens}")
                 else:
                     text_ids = c.input_ids
 

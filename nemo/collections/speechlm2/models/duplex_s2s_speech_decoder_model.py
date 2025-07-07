@@ -394,6 +394,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                     "text_to_text_loss": text_loss,
                     "text_batch_size": text_input_ids.shape[0],
                     "text_sequence_length": text_input_ids.shape[1],
+                    "text_num_tokens": batch["text_data"]["text_token_lens"].sum(),
                 }
             )
 
