@@ -144,6 +144,8 @@ class LhotseTextJsonlAdapter:
             random.Random(seed).shuffle(paths)
         for path in paths:
             for data in load_jsonl(path):
+                if self.text_field not in data:
+                    continue
                 yield TextExample(data[self.text_field], language=self.language)
 
 

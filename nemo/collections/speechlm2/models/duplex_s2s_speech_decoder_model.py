@@ -46,6 +46,8 @@ from nemo.core.neural_types import AudioSignal, LabelsType, LengthsType, NeuralT
 from nemo.utils import logging
 import os
 import torchaudio
+import copy
+
 
 class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
     def __init__(self, cfg: dict) -> None:
@@ -74,6 +76,10 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         self.embed_tokens = self.llm.embed_tokens
         del self.llm.embed_tokens
         maybe_install_lora(self)
+
+        # We may use a separate text head for text-to-text prediction
+        if self.cfg.get("separate_text_head", False):
+            self.text_head = copy.deepcopy(self.lm_head)
 
         # Load the pretrained streaming ASR model and copy its parameters into the audio perception module.
         setup_speech_encoder(self)
@@ -382,7 +388,10 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                 use_cache=False,
                 return_dict=True,
             )
-            text_logits = self.lm_head(text_out['last_hidden_state'])  # (B, T, Vt)
+            if hasattr(self, "text_head"):
+                text_logits = self.text_head(text_out['last_hidden_state'])  # (B, T, Vt)
+            else:
+                text_logits = self.lm_head(text_out['last_hidden_state'])  # (B, T, Vt)
 
             text_loss = torch.nn.functional.cross_entropy(
                 text_logits.flatten(0, 1),  # (B, T, Vt) -> (*, Vt)
@@ -506,6 +515,34 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
     def test_step(self, *args, **kwargs):
         return self.validation_step(*args, **kwargs)
 
+    def on_predict_epoch_start(self) -> None:
+        return self.on_train_epoch_start()
+
+    def predict_step(self, batch: dict, batch_idx: int, dataloader_idx: int=0):
+        batch = batch["audio_data"]
+
+        force_bos_positions = None
+        force_bos_num_tokens_after_user_eos = self.cfg.prediction.get("force_bos_num_tokens_after_user_eos", None)
+        if force_bos_num_tokens_after_user_eos is not None:
+            force_bos_positions = []
+            for cur_source_tokens in batch["source_tokens"]:
+                tmp = torch.where(cur_source_tokens == self.text_eos_id)[0]
+                if len(tmp) > 0:
+                    force_bos_positions.append(tmp[0].item() + force_bos_num_tokens_after_user_eos)
+                else:
+                    force_bos_positions.append(None)
+
+        prediction = self.offline_inference(
+            batch["source_audio"],
+            batch["source_audio_lens"],
+            decode_audio=self.cfg.prediction.decode_audio,
+            input_pad_len=self.cfg.prediction.max_new_seconds * self.cfg.prediction.input_sample_rate,
+            force_bos_positions=force_bos_positions,
+        )
+        prediction["sample_id"] = batch["sample_id"]
+        return prediction
+
+
     def _get_bos_embedding(self) -> torch.Tensor:
         """
         Remove the audio codec embedding for the beginning of AR decoding.
@@ -520,6 +557,8 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         input_signal: torch.Tensor,
         input_signal_lens: torch.Tensor,
         decode_audio: bool = True,
+        input_pad_len: int = 0,
+        force_bos_positions = None,
     ) -> dict[str, torch.Tensor]:
         """
         Autoregressive prediction.
@@ -528,6 +567,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             input_signal: a batch of waveforms with shape (B, T) with source sampling rate.
             input_signal_lens: example lengths as number of samples of shape (B,).
             decode_audio: bool, whether to decode audio codes to waveform.
+            input_pad_len: int, number of frames to pad the input.
 
         Returns:
             A dict with keys:
@@ -538,9 +578,13 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                 * "audio": generated waveform of shape (B, T3) (`decode_audio=True`).
                 * "audio_len" output lengths as number of waveform samples of shape (B,) (when `decode_audio=True`).
         """
-        if input_signal.shape[1] > 22050 * 200:
-            input_signal = input_signal[:, :22050 * 200]
-            input_signal_lens = torch.clamp(input_signal_lens, max=22050 * 200)
+
+        if force_bos_positions is not None:
+            assert input_signal.shape[0] == len(force_bos_positions), "force_bos_positions must have the same length as batch size"
+
+        if input_pad_len > 0:
+            input_signal = torch.nn.functional.pad(input_signal, (0, input_pad_len), mode='constant', value=0)
+            input_signal_lens = input_signal_lens + input_pad_len
 
         input_embeds, lengths = self.perception(
             input_signal=input_signal,
@@ -585,6 +629,13 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         # Autoregressive loop
         for t in range(1, T):
             last_emb = self.embed_tokens(gen_text[:, t - 1])
+            if force_bos_positions is not None:
+                for batch_idx in range(last_emb.shape[0]):
+                    if force_bos_positions[batch_idx] == t and not (gen_text[batch_idx, :t] == self.text_bos_id).any():
+                        last_emb[batch_idx] = self.embed_tokens(
+                            torch.full((1,), fill_value=self.text_bos_id, device=self.device)
+                        )
+
             input_embeds[:, t] += last_emb
             current_audio = gen_audio[:, t - 1 : t, :]
             ans = self(input_embeds[:, t : t + 1], cache=ans["cache"], input_audio_tokens=current_audio)
