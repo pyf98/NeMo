@@ -91,14 +91,6 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             num_audio_tokens_per_codebook=self.speech_vocab_size,
         )
 
-        self.embed_audio_tokens = torch.nn.ModuleList(
-            [
-                torch.nn.Embedding(self.speech_vocab_size, self.embed_tokens.embedding_dim)
-                for _ in range(self._num_codebooks)
-            ]
-        )
-        self.audio_head = torch.nn.Linear(self.llm.config.hidden_size, self.speech_vocab_size * self._num_codebooks)
-
         # cached for quicker audio decoding
         self.register_buffer(
             "_control_codes",
@@ -749,9 +741,19 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
 
                 parallelize_module(transformer_block, tp_mesh, plan)
 
-            for m in (self.lm_head, self.audio_head):
+            for m in (self.lm_head,):
                 parallelize_module(
                     m,
+                    tp_mesh,
+                    ColwiseParallel(
+                        input_layouts=Shard(1),
+                        output_layouts=Shard(-1),
+                        use_local_output=False,
+                    ),
+                )
+            if hasattr(self, "text_head"):
+                parallelize_module(
+                    self.text_head,
                     tp_mesh,
                     ColwiseParallel(
                         input_layouts=Shard(1),
@@ -773,3 +775,5 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             self.lm_head = fully_shard(self.lm_head, **fsdp_config)
             self.perception = fully_shard(self.perception, **fsdp_config)
             self.speech_generation = fully_shard(self.speech_generation, **fsdp_config)
+            if hasattr(self, "text_head"):
+                self.text_head = fully_shard(self.text_head, **fsdp_config)
