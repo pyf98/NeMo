@@ -52,6 +52,9 @@ def train(cfg):
         input_roles=cfg.data.input_roles,
         output_roles=cfg.data.output_roles,
         text_max_tokens=cfg.data.text_max_tokens,
+        s2s_bos_id=model.s2s_bos_id,
+        s2s_eos_id=model.s2s_eos_id,
+        s2s_pad_id=model.s2s_pad_id,
     )
     datamodule = DataModule(cfg.data, tokenizer=model.tokenizer, dataset=dataset)
 

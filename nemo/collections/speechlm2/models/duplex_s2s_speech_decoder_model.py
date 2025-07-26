@@ -100,6 +100,13 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         self._use_fsdp = False
         self._use_tp = False
 
+        # Set special tokens for S2S data
+        self.s2s_bos_id = self.tokenizer.token_to_id(self.cfg.s2s_tokens.bos_token)
+        self.s2s_eos_id = self.tokenizer.token_to_id(self.cfg.s2s_tokens.eos_token)
+        self.s2s_pad_id = self.tokenizer.token_to_id(self.cfg.s2s_tokens.pad_token)
+        assert self.s2s_bos_id is not None and self.s2s_eos_id is not None and self.s2s_pad_id is not None, \
+            f"BOS token {self.cfg.s2s_tokens.bos_token}, EOS token {self.cfg.s2s_tokens.eos_token}, or PAD token {self.cfg.s2s_tokens.pad_token} are not in the tokenizer"
+
     @property
     def speech_vocab_size(self):
         """Return the size of the audio codec codebook including extra speech BOS and EOS tokens."""
@@ -127,11 +134,11 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
 
     @property
     def text_bos_id(self) -> int:
-        return self.tokenizer.bos_id
+        return self.s2s_bos_id
 
     @property
     def text_eos_id(self) -> int:
-        return self.tokenizer.eos_id
+        return self.s2s_eos_id
 
     @property
     def text_pad_id(self) -> int:
@@ -149,7 +156,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         and x indicates tokens corresponding to actual text
 
         """
-        return get_pad_id(self.tokenizer)
+        return self.s2s_pad_id
 
     def cal_token_acc(self, pad_outputs, pad_targets, ignore_label):
         pad_pred = pad_outputs.argmax(-1)
@@ -325,14 +332,15 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                 loss_mask=inputs["loss_mask"],
             )
             num_frames = inputs["input_lens"].sum()
+            self.log("audio_num_frames", num_frames.to(torch.float32), on_step=True, on_epoch=True, reduce_fx="sum")
+
+            # custom token loss weight
+            text_token_loss_weight = torch.ones(forward_outputs["text_logits"].shape[-1], device=self.device)
+            text_token_loss_weight[self.text_bos_id] = self.cfg.get("token_loss_weight", {}).get("bos", 1.0)
+            text_token_loss_weight[self.text_eos_id] = self.cfg.get("token_loss_weight", {}).get("eos", 1.0)
+            text_token_loss_weight[self.text_pad_id] = self.cfg.get("token_loss_weight", {}).get("pad", 1.0)
 
             with loss_parallel():
-                # custom token loss weight
-                text_token_loss_weight = torch.ones(forward_outputs["text_logits"].shape[-1], device=self.device)
-                text_token_loss_weight[self.text_bos_id] = self.cfg.get("token_loss_weight", {}).get("bos", 1.0)
-                text_token_loss_weight[self.text_eos_id] = self.cfg.get("token_loss_weight", {}).get("eos", 1.0)
-                text_token_loss_weight[self.text_pad_id] = self.cfg.get("token_loss_weight", {}).get("pad", 1.0)
-
                 # mask the loss based on the loss_mask for text channel
                 text_loss_mask = inputs["loss_mask"][:, :, 0].flatten(0, 1)
                 text_loss = (
@@ -365,17 +373,14 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                 "audio_to_audio_loss": audio_loss,
                 "audio_batch_size": B,
                 "audio_sequence_length": T,
-                "audio_num_frames": num_frames.to(torch.float32),  # avoid warning
-                "audio_padding_ratio": num_frames / (B * T),
+                # "audio_num_frames": num_frames.to(torch.float32),  # avoid warning
+                "audio_nonpadding_ratio": num_frames / (B * T),
             }
             res.update(ans)
 
         if batch["text_data"] is not None:
-            text_input_ids = batch["text_data"]["text_tokens"][:, :-1]
-            text_target = batch["text_data"]["text_tokens"][:, 1:]
-
             text_out = self.llm(
-                inputs_embeds=self.embed_tokens(text_input_ids),
+                inputs_embeds=self.embed_tokens(batch["text_data"]["text_inputs"]),
                 past_key_values=None,
                 use_cache=False,
                 return_dict=True,
@@ -385,19 +390,24 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             else:
                 text_logits = self.lm_head(text_out['last_hidden_state'])  # (B, T, Vt)
 
-            text_loss = torch.nn.functional.cross_entropy(
-                text_logits.flatten(0, 1),  # (B, T, Vt) -> (*, Vt)
-                text_target.flatten(0, 1),
-                ignore_index=self.text_pad_id,
-            )
+            with loss_parallel():
+                text_to_text_loss = torch.nn.functional.cross_entropy(
+                    text_logits.flatten(0, 1),  # (B, T, Vt) -> (*, Vt)
+                    batch["text_data"]["text_targets"].flatten(0, 1),
+                    reduction="none",
+                )
+
+            text_to_text_loss_mask = batch["text_data"]["text_masks"].flatten(0, 1)
+            text_to_text_loss = (text_to_text_loss * text_to_text_loss_mask).sum() / text_to_text_loss_mask.sum()
+
             res.update(
                 {
-                    "text_to_text_loss": text_loss,
-                    "text_batch_size": text_input_ids.shape[0],
-                    "text_sequence_length": text_input_ids.shape[1],
-                    "text_num_tokens": batch["text_data"]["text_token_lens"].sum(),
+                    "text_to_text_loss": text_to_text_loss,
+                    "text_batch_size": batch["text_data"]["text_inputs"].shape[0],
+                    "text_sequence_length": batch["text_data"]["text_inputs"].shape[1],
                 }
             )
+            self.log("text_num_tokens", batch["text_data"]["text_masks"].sum().to(torch.float32), on_step=True, on_epoch=True, reduce_fx="sum")
 
         res["loss"] = (1. - self.cfg.text_to_text_loss_weight) * res.get("audio_loss", 0.0) + \
             self.cfg.text_to_text_loss_weight * res.get("text_to_text_loss", 0.0)
@@ -409,58 +419,84 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
 
     def on_validation_epoch_start(self) -> None:
         self.on_train_epoch_start()
-        self.asr_bleu = ASRBLEU(self.cfg.scoring_asr).reset()
-        self.bleu = BLEU().reset()
-        # This mos evaluation is relied on UTMOSv2,
-        # it is not very accurate since generated audio contains long silence segments.
-        # self.mos = MOS().reset()
+        if self.cfg.get("validate_s2s", True):
+            self.asr_bleu = ASRBLEU(self.cfg.scoring_asr).reset()
+            self.bleu = BLEU().reset()
+            # This mos evaluation is relied on UTMOSv2,
+            # it is not very accurate since generated audio contains long silence segments.
+            # self.mos = MOS().reset()
 
     def on_validation_epoch_end(self, prefix="val") -> None:
-        asr_bleu = self.asr_bleu.compute()
-        for k, m in asr_bleu.items():
-            self.log(f"{prefix}_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
-        bleu = self.bleu.compute()
-        for k, m in bleu.items():
-            self.log(f"{prefix}_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
-        # mos = self.mos.compute()
-        # for k, m in mos.items():
-        #     self.log(f"{prefix}_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
+        if self.cfg.get("validate_s2s", True):
+            asr_bleu = self.asr_bleu.compute()
+            for k, m in asr_bleu.items():
+                self.log(f"{prefix}_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
+            bleu = self.bleu.compute()
+            for k, m in bleu.items():
+                self.log(f"{prefix}_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
+            # mos = self.mos.compute()
+            # for k, m in mos.items():
+            #     self.log(f"{prefix}_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
 
     def validation_step(self, batch: dict, batch_idx: int):
-        for name, dataset_batch in batch.items():
+        for name, all_dataset_batch in batch.items():
 
-            if dataset_batch is None:
+            if all_dataset_batch is None:
                 continue  # some dataset is exhausted
 
-            dataset_batch = dataset_batch["audio_data"]
+            # Validation for S2S data (using offline inference)
+            dataset_batch = all_dataset_batch["audio_data"]
+            if dataset_batch is not None:
+                results = self.offline_inference(
+                    dataset_batch["source_audio"],
+                    dataset_batch["source_audio_lens"],
+                )
 
-            results = self.offline_inference(
-                dataset_batch["source_audio"],
-                dataset_batch["source_audio_lens"],
-            )
+                with fp32_precision():
+                    pred_audios = resample(results["audio"], 22050, 16000)
 
+                if self.cfg.get('audio_save_path') is not None:
+                    self.save_predicted_audio_stereo(pred_audios, dataset_batch, name)
 
-            with fp32_precision():
-                pred_audios = resample(results["audio"], 22050, 16000)
+                # self.mos.update(
+                #     name=name,
+                #     pred_audios=pred_audios,
+                #     tmp_dir=os.path.join(self.cfg.get('audio_save_path'), "tmp"),
+                # )
 
+                self.asr_bleu.update(
+                    name=name,
+                    refs=dataset_batch["target_texts"],
+                    pred_audio=pred_audios,
+                    pred_audio_lens=(results["audio_len"] / 22050 * 16000).to(torch.long),
+                )
 
-            if self.cfg.get('audio_save_path') is not None:
-                self.save_predicted_audio_stereo(pred_audios, dataset_batch, name)
+                self.bleu.update(name=name, refs=dataset_batch["target_texts"], hyps=results["text"])
 
-            # self.mos.update(
-            #     name=name,
-            #     pred_audios=pred_audios,
-            #     tmp_dir=os.path.join(self.cfg.get('audio_save_path'), "tmp"),
-            # )
+            # Validation for text-only data
+            dataset_batch = all_dataset_batch["text_data"]
+            if dataset_batch is not None:
+                text_out = self.llm(
+                    inputs_embeds=self.embed_tokens(dataset_batch["text_inputs"]),
+                    past_key_values=None,
+                    use_cache=False,
+                    return_dict=True,
+                )
+                if hasattr(self, "text_head"):
+                    text_logits = self.text_head(text_out['last_hidden_state'])  # (B, T, Vt)
+                else:
+                    text_logits = self.lm_head(text_out['last_hidden_state'])  # (B, T, Vt)
 
-            self.asr_bleu.update(
-                name=name,
-                refs=dataset_batch["target_texts"],
-                pred_audio=pred_audios,
-                pred_audio_lens=(results["audio_len"] / 22050 * 16000).to(torch.long),
-            )
+                with loss_parallel():
+                    text_to_text_loss = torch.nn.functional.cross_entropy(
+                        text_logits.flatten(0, 1),  # (B, T, Vt) -> (*, Vt)
+                        dataset_batch["text_targets"].flatten(0, 1),
+                        reduction="none",
+                    )
 
-            self.bleu.update(name=name, refs=dataset_batch["target_texts"], hyps=results["text"])
+                text_to_text_loss_mask = dataset_batch["text_masks"].flatten(0, 1)
+                text_to_text_loss = (text_to_text_loss * text_to_text_loss_mask).sum() / text_to_text_loss_mask.sum()
+                self.log(f"val_{name}_text_to_text_loss", text_to_text_loss)
 
     def save_predicted_audio_stereo(self, pred_audios, dataset_batch, name):
 
@@ -495,8 +531,6 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                 stereo_audio.float().cpu(),
                 16000
             )
-
-
 
     def on_test_epoch_start(self) -> None:
         return self.on_validation_epoch_start()

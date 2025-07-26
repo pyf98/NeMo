@@ -22,7 +22,7 @@ from lhotse.utils import ifnone
 
 from nemo.collections.common.tokenizers import TokenizerSpec
 from nemo.collections.common.data.lhotse.text_adapters import Formattable
-from nemo.collections.speechlm2.data.utils import get_pad_id
+# from nemo.collections.speechlm2.data.utils import get_pad_id
 from nemo.utils import logging
 
 
@@ -90,6 +90,9 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
         input_roles: list[str] = None,
         output_roles: list[str] = None,
         text_max_tokens: int = 10000,
+        s2s_bos_id: int = None,
+        s2s_eos_id: int = None,
+        s2s_pad_id: int = None,
     ):
         self.tokenizer = tokenizer
         self.frame_length = frame_length
@@ -99,8 +102,12 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
         self.output_roles = set(ifnone(output_roles, ["agent"]))
         self.text_max_tokens = text_max_tokens
 
-        assert tokenizer.bos is not None, "BOS support in the tokenizer is required for S2S models."
-        assert tokenizer.eos is not None, "EOS support in the tokenizer is required for S2S models."
+        self.s2s_bos_id = s2s_bos_id
+        self.s2s_eos_id = s2s_eos_id
+        self.s2s_pad_id = s2s_pad_id
+        assert self.s2s_bos_id is not None, "BOS ID is required for S2S models."
+        assert self.s2s_eos_id is not None, "EOS ID is required for S2S models."
+        assert self.s2s_pad_id is not None, "PAD ID is required for S2S models."
 
     def __getitem__(self, all_cuts: CutSet) -> dict:
         # audio mini-batch
@@ -113,10 +120,12 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
                 cuts.resample(self.target_sample_rate), recording_field="target_audio"
             )
             target_tokens, target_token_lens = collate_token_channel(
-                cuts, self.tokenizer, self.frame_length, roles=self.output_roles
+                cuts, self.tokenizer, self.frame_length, roles=self.output_roles,
+                s2s_bos_id=self.s2s_bos_id, s2s_eos_id=self.s2s_eos_id, s2s_pad_id=self.s2s_pad_id,
             )
             source_tokens, source_token_lens = collate_token_channel(
-                cuts, self.tokenizer, self.frame_length, roles=self.input_roles
+                cuts, self.tokenizer, self.frame_length, roles=self.input_roles,
+                s2s_bos_id=self.s2s_bos_id, s2s_eos_id=self.s2s_eos_id, s2s_pad_id=self.s2s_pad_id,
             )
             audio_data = {
                 "sample_id": [" ".join(s.id for s in cut.supervisions if s.speaker in ["user"]) for cut in cuts],
@@ -133,32 +142,36 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
                 ],
             }
 
-        # text mini-batch
+        # text mini-batch (pretraining or SFT)
         text_cuts = all_cuts.filter(lambda c: isinstance(c, Formattable))
         text_data = None
         if text_cuts:
-            text_tokens = []
-            text_token_lens = []
+            text_inputs = []
+            text_input_lens = []
+            text_targets = []
+            text_target_lens = []
+            text_masks = []
             for c in text_cuts:
                 if c.input_ids.shape[0] > self.text_max_tokens:
-                    # randomly select a segment of input_ids
-                    # start = torch.randint(0, c.input_ids.shape[0] - self.text_max_tokens + 1, (1,)).item()
-                    # end = start + self.text_max_tokens
-                    # text_ids = c.input_ids[start:end]
                     raise RuntimeError(f"Text too long: {c.input_ids.shape[0]} > {self.text_max_tokens}")
-                else:
-                    text_ids = c.input_ids
 
-                text_tokens.append(text_ids)
-                text_token_lens.append(text_ids.shape[0])
+                text_inputs.append(c.input_ids[:-1])
+                text_input_lens.append(len(c.input_ids) - 1)
+                text_targets.append(c.input_ids[1:])
+                text_target_lens.append(len(c.input_ids) - 1)
+                text_masks.append(c.mask[1:])
 
-            text_tokens = collate_vectors(
-                text_tokens, padding_value=get_pad_id(self.tokenizer)
-            )
-            text_token_lens = torch.tensor(text_token_lens, dtype=torch.long)
+            text_inputs = collate_vectors(text_inputs, padding_value=self.tokenizer.pad)
+            text_input_lens = torch.tensor(text_input_lens, dtype=torch.long)
+            text_targets = collate_vectors(text_targets, padding_value=self.tokenizer.pad)
+            text_target_lens = torch.tensor(text_target_lens, dtype=torch.long)
+            text_masks = collate_vectors(text_masks, padding_value=False)
             text_data = {
-                "text_tokens": text_tokens,
-                "text_token_lens": text_token_lens,
+                "text_inputs": text_inputs,
+                "text_input_lens": text_input_lens,
+                "text_targets": text_targets,
+                "text_target_lens": text_target_lens,
+                "text_masks": text_masks,
             }
 
         return {
@@ -172,14 +185,24 @@ def collate_token_channel(
     tokenizer: TokenizerSpec,
     frame_length: Seconds,
     roles: set[str],
+    s2s_bos_id: int,
+    s2s_eos_id: int,
+    s2s_pad_id: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    pad_id = get_pad_id(tokenizer)
     tokens = [
-        build_token_channel(c, tokenizer=tokenizer, frame_length=frame_length, roles=roles, pad_id=pad_id)
+        build_token_channel(
+            c,
+            tokenizer=tokenizer,
+            frame_length=frame_length,
+            roles=roles,
+            s2s_bos_id=s2s_bos_id,
+            s2s_eos_id=s2s_eos_id,
+            s2s_pad_id=s2s_pad_id,
+        )
         for c in cuts
     ]
     token_lens = torch.tensor([len(tt) for tt in tokens])
-    tokens = collate_vectors(tokens, padding_value=pad_id)
+    tokens = collate_vectors(tokens, padding_value=s2s_pad_id)
     return tokens, token_lens
 
 
@@ -188,17 +211,19 @@ def build_token_channel(
     tokenizer: TokenizerSpec,
     frame_length: Seconds,
     roles: set[str],
-    pad_id: int = -1,
+    s2s_bos_id: int,
+    s2s_eos_id: int,
+    s2s_pad_id: int,
 ) -> torch.Tensor:
     diagnostic = f"Extra info: {cut.id=}"
     if getattr(cut, "shard_origin", None) is not None:
         diagnostic = f"{diagnostic} {cut.shard_origin=}"
 
     total = compute_num_frames(cut.duration, frame_length, cut.sampling_rate)
-    tokens = torch.ones(total, dtype=torch.long) * pad_id
+    tokens = torch.ones(total, dtype=torch.long) * s2s_pad_id
     for supervision in cut.supervisions:
         if supervision.speaker in roles:
-            text_ids = torch.as_tensor([tokenizer.bos] + tokenizer.text_to_ids(supervision.text))
+            text_ids = torch.as_tensor([s2s_bos_id] + tokenizer.text_to_ids(supervision.text))
 
             # Determine the frame offset for the start of the supervision to insert the text tokens.
             pos = compute_num_frames(supervision.start, frame_length, cut.sampling_rate)
@@ -210,7 +235,7 @@ def build_token_channel(
 
             # Determine the frame offset for the last non-EOS text token to form a valid range for insertion;
             # Note that EOS will be placed possibly much later, at the frame that coincides with end of speech,
-            # rather than end of text. The gap between last non-EOS token and EOS token will be filled with `pad_id`.
+            # rather than end of text. The gap between last non-EOS token and EOS token will be filled with `s2s_pad_id`.
             endpos = pos + len(text_ids)
             if endpos > len(tokens):
                 trunc_len = len(tokens) - pos
@@ -226,7 +251,7 @@ def build_token_channel(
             # Insert EOS at the end of the supervision segment.
             eospos = compute_num_frames(supervision.end, frame_length, cut.sampling_rate)
             if eospos < len(tokens):  # skip otherwise - unfinished turn
-                tokens[eospos] = tokenizer.eos
+                tokens[eospos] = s2s_eos_id
 
     return tokens
 

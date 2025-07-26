@@ -14,7 +14,6 @@
 import os
 import random
 import warnings
-from copy import deepcopy
 from dataclasses import dataclass
 from functools import partial
 from typing import Any, Optional, Sequence, Union
@@ -44,6 +43,7 @@ from nemo.collections.common.data.lhotse.cutset import (
     guess_parse_cutset,
     read_cutset_from_config,
 )
+from nemo.collections.common.data.lhotse.text_adapters import TextExample
 from nemo.collections.common.data.lhotse.sampling import (
     BucketingFilter,
     DurationFilter,
@@ -488,7 +488,17 @@ def get_lhotse_sampler_from_config(config, global_rank, world_size, tokenizer=No
                 "(note: that will disable token-per-second filtering and 2D bucketing features)"
             )
 
-        if config.use_multimodal_sampling and config.cut_text_into_windows_tokens is not None:
+        if config.prompt_format is not None:
+            cuts = cuts.map(
+                partial(tokenize_with_prompt, tokenizer=tokenizer, prompt_format=config.prompt_format), apply_fn=None
+            )
+        else:
+            if not isinstance(tokenizer, TokenizerWrapper):
+                tokenizer = TokenizerWrapper(tokenizer)
+            cuts = cuts.map(partial(tokenize, tokenizer=tokenizer), apply_fn=None)
+
+        # For text pretraining data, we may want to cut long text into windows.
+        if config.cut_text_into_windows_tokens is not None:
             cuts = CutSet(
                 LazyFlattener(
                     cuts.map(
@@ -501,15 +511,6 @@ def get_lhotse_sampler_from_config(config, global_rank, world_size, tokenizer=No
                     )
                 )
             )
-
-        if config.prompt_format is not None:
-            cuts = cuts.map(
-                partial(tokenize_with_prompt, tokenizer=tokenizer, prompt_format=config.prompt_format), apply_fn=None
-            )
-        else:
-            if not isinstance(tokenizer, TokenizerWrapper):
-                tokenizer = TokenizerWrapper(tokenizer)
-            cuts = cuts.map(partial(tokenize, tokenizer=tokenizer), apply_fn=None)
 
     # 2. Optional augmentations.
     # 2.a. Noise mixing.
@@ -666,6 +667,7 @@ def determine_sampling_constraint(cuts: CutSet, bucket_duration_bins, config) ->
                 token_equivalent_duration=config.token_equivalent_duration,
                 strict_2d=config.bucketing_2d_strict_mode,
                 max_ratio=config.max_tpt if isinstance(config.max_tpt, Sequence) else None,
+                measure_total_length=config.measure_total_length,
             )
             cuts = cuts.filter(BucketingFilter(constraint))
         else:
@@ -674,6 +676,7 @@ def determine_sampling_constraint(cuts: CutSet, bucket_duration_bins, config) ->
                 batch_size=config.batch_size,
                 batch_tokens=config.batch_tokens,
                 quadratic_factor=config.quadratic_factor,
+                measure_total_length=config.measure_total_length,
             )
     else:
         if config.bucket_batch_size is not None:
@@ -877,9 +880,9 @@ def _select_channel(cut, channel_selector: int | str) -> list:
 
 
 def _cut_text_into_windows(cut, num_tokens: int, tokenizer) -> list:
-    """Split cut.text into chunks of num_tokens, creating new cuts with copied attributes from the original cut.
+    """Add EOS at the end and cut text into chunks of num_tokens.
 
-    This only applies to pretraining data without chat template.
+    This only applies to text pretraining data without chat template.
 
     Args:
         cut: TextExample, the cut object containing text to split
@@ -889,13 +892,25 @@ def _cut_text_into_windows(cut, num_tokens: int, tokenizer) -> list:
     Returns:
         list: A list of new cut objects, each containing a chunk of tokens
     """
-    tokens = tokenizer.text_to_ids(cut.text)
+    assert isinstance(cut, TextExample), f"Input must be a TextExample to be cut into windows, but got {type(cut)}"
+
+    # Add EOS at the end
+    full_tokens = torch.nn.functional.pad(cut.input_ids, (0, 1), value=tokenizer.eos)
+    full_mask = torch.nn.functional.pad(cut.mask, (0, 1), value=True)
+    # The actual number of tokens per chunk is num_tokens + 1
+    num_tokens = num_tokens + 1
+
     ans = []
-    for i in range(0, len(tokens), num_tokens):
-        new_cut = type(cut)(
-            text=tokenizer.ids_to_text(tokens[i : i + num_tokens]),
+    for i in range(0, len(full_tokens), num_tokens):
+        cur_tokens = full_tokens[i : i + num_tokens]
+        cur_mask = full_mask[i : i + num_tokens]
+        cur_cut = TextExample(
+            text=tokenizer.ids_to_text(cur_tokens, remove_special_tokens=False),
             language=cut.language,
-            custom=deepcopy(cut.custom),
         )
-        ans.append(new_cut)
+        cur_cut.input_ids = cur_tokens
+        cur_cut.context_ids = torch.tensor([]).to(cut.context_ids)
+        cur_cut.answer_ids = cur_tokens
+        cur_cut.mask = cur_mask
+        ans.append(cur_cut)
     return ans
