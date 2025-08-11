@@ -62,6 +62,10 @@ def main(cfg: SalmEvalConfig):
             apply_fn=None,
         )
         .map(
+            partial(set_token_equivalent_duration, token_equivalent_duration=model.token_equivalent_duration),
+            apply_fn=None,
+        )
+        .map(
             partial(
                 cut_to_conversation,
                 audio_locator_tag=model.audio_locator_tag,
@@ -146,6 +150,13 @@ def replace_audio_locator_tag(
     for turn in conversation.turns:
         if isinstance(turn, AudioTurn):
             turn.audio_locator_tag = audio_locator_tag
+    return conversation
+
+
+def set_token_equivalent_duration(
+    conversation: NeMoMultimodalConversation, token_equivalent_duration: float
+) -> NeMoMultimodalConversation:
+    conversation.token_equivalent_duration = token_equivalent_duration
     return conversation
 
 
