@@ -37,6 +37,7 @@ from nemo.collections.common.data.lhotse.text_adapters import (
     LhotseTextPairAdapter,
     NeMoMultimodalConversation,
     NeMoMultimodalConversationJsonlAdapter,
+    NeMoMultimodalConversationDestaJsonlAdapter,
     NeMoMultimodalConversationShareGPTJsonlAdapter,
     NeMoSFTJsonlAdapter,
     TextTurn,
@@ -286,6 +287,26 @@ def read_multimodal_conversation_jsonl(config: DictConfig) -> tuple[CutSet, bool
     """Read paths to multimodal conversation JSONL files and create a CutSet."""
     cuts = CutSet(
         NeMoMultimodalConversationJsonlAdapter(
+            manifest_filepath=config.manifest_filepath,
+            tarred_audio_filepaths=config.get("tarred_audio_filepaths"),
+            audio_locator_tag=config.audio_locator_tag,
+            token_equivalent_duration=config.get("token_equivalent_duration"),
+            shuffle_shards=config.shuffle,
+            shard_seed=config.shard_seed,
+            system_prompt=config.get("tags", {}).get("system_prompt"),
+            context=config.get("tags", {}).get("context"),
+        )
+    )
+    if not config.get("force_finite", False):
+        cuts = cuts.repeat()
+    return cuts, True
+
+
+@data_type_parser("multimodal_conversation_desta")
+def read_multimodal_conversation_desta_jsonl(config: DictConfig) -> tuple[CutSet, bool]:
+    """Read paths to multimodal conversation JSONL files and create a CutSet."""
+    cuts = CutSet(
+        NeMoMultimodalConversationDestaJsonlAdapter(
             manifest_filepath=config.manifest_filepath,
             tarred_audio_filepaths=config.get("tarred_audio_filepaths"),
             audio_locator_tag=config.audio_locator_tag,

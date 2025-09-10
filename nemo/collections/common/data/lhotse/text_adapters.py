@@ -630,6 +630,122 @@ class NeMoMultimodalConversationJsonlAdapter:
                 )
 
 
+@dataclass
+class NeMoMultimodalConversationDestaJsonlAdapter:
+    manifest_filepath: str | list[str]
+    audio_locator_tag: str
+    tarred_audio_filepaths: str | list[str] = None
+    token_equivalent_duration: float = None
+    shuffle_shards: bool = False
+    shard_seed: Union[int, Literal["trng", "randomized"]] = "trng"
+    system_prompt: str | None = None
+    context: str | None = None
+
+    def __post_init__(self):
+        self.manifest_filepath = expand_sharded_filepaths(self.manifest_filepath)
+        if self.tarred_audio_filepaths is not None:
+            self.tarred_audio_filepaths = expand_sharded_filepaths(self.tarred_audio_filepaths)
+            assert len(self.manifest_filepath) == len(
+                self.tarred_audio_filepaths
+            ), f"{len(self.manifest_filepath)} != {len(self.tarred_audio_filepaths)}"
+
+    def __iter__(self) -> Iterator[NeMoMultimodalConversation]:
+        if self.tarred_audio_filepaths is not None:
+            yield from self._iter_tar()
+        else:
+            yield from self._iter_jsonl()
+
+    def _should_skip(self, example: dict) -> bool:
+        custom = example.get("custom")
+        if custom is None:
+            return False
+        return bool(custom.get("_skipme", False))
+
+    def _iter_tar(self):
+        paths = list(zip(self.manifest_filepath, self.tarred_audio_filepaths))
+        if self.shuffle_shards:
+            seed = resolve_seed(self.shard_seed)
+            random.Random(seed).shuffle(paths)
+        for jsonl_path, tar_path in paths:
+            tar = iter(TarIterator(tar_path))
+            for data in load_jsonl(jsonl_path):
+                if self._should_skip(data):
+                    continue
+                audio_turns = [t for t in data["conversations"] if t["type"] == "audio"]
+                cuts = []
+                for turn in audio_turns:
+                    recording, audio_path = next(tar)
+                    audio_path = str(audio_path)
+                    cut = recording.to_cut()
+                    # assert (
+                    #     audio_path == turn['value']
+                    # ), f"Mismatch between JSONL and tar. JSONL defines audio path={turn['value']} but we got the following from tar {audio_path=}.\nBad inputs in: {jsonl_path=} {tar_path=}"
+                    cuts.append(cut)
+                cuts = deque(cuts)
+                turns = [
+                    (
+                        TextTurn(
+                            value=turn["value"],
+                            role=turn["from"].lower(),
+                        )
+                        if turn["type"] == "text"
+                        else AudioTurn(
+                            cut=(c := cuts.popleft()),
+                            text=c.supervisions[0].text if c.supervisions else None,
+                            role=turn["from"].lower(),
+                            audio_locator_tag=self.audio_locator_tag,
+                        )
+                    )
+                    for turn in data["conversations"]
+                ]
+                if self.context is not None and turns[0].role == "user" and isinstance(turns[0], AudioTurn):
+                    turns = [TextTurn(role="user", value=self.context)] + turns
+                if self.system_prompt is not None and turns[0].role != "system":
+                    turns = [TextTurn(role="system", value=self.system_prompt)] + turns
+                yield NeMoMultimodalConversation(
+                    id=data["id"],
+                    turns=turns,
+                    token_equivalent_duration=self.token_equivalent_duration,
+                    custom=data.get("custom"),
+                )
+
+    def _iter_jsonl(self):
+        paths = self.manifest_filepath
+        if self.shuffle_shards:
+            seed = resolve_seed(self.shard_seed)
+            random.Random(seed).shuffle(paths)
+        for path in paths:
+            for data in load_jsonl(path):
+                if self._should_skip(data):
+                    continue
+                turns = [
+                    (
+                        TextTurn(
+                            value=turn["value"],
+                            role=turn["from"].lower(),
+                        )
+                        if turn["type"] == "text"
+                        else AudioTurn(
+                            cut=(cut := Recording.from_file(get_full_path(turn["value"], path)).to_cut()),
+                            text=cut.supervisions[0].text if cut.supervisions else None,
+                            role=turn["from"].lower(),
+                            audio_locator_tag=self.audio_locator_tag,
+                        )
+                    )
+                    for turn in data["conversations"]
+                ]
+                if self.context is not None and turns[0].role == "user" and isinstance(turns[0], AudioTurn):
+                    turns = [TextTurn(role="user", value=self.context)] + turns
+                if self.system_prompt is not None and turns[0].role != "system":
+                    turns = [TextTurn(role="system", value=self.system_prompt)] + turns
+                yield NeMoMultimodalConversation(
+                    id=data["id"],
+                    turns=turns,
+                    token_equivalent_duration=self.token_equivalent_duration,
+                    custom=data.get("custom"),
+                )
+
+
 class TarIterator:
     """
     Copy of lhotse.shar.readers.tar.TarIterator, modified to read both Lhotse-Shar style audio tar files
