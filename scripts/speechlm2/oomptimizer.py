@@ -28,7 +28,7 @@ from lhotse import compute_num_samples
 from omegaconf import OmegaConf
 from torch.utils.data import DataLoader, IterableDataset
 
-from nemo.collections.speechlm2 import SALM
+from nemo.collections.speechlm2 import SALM, SALMWithAsrDecoder
 from nemo.core.neural_types import AudioSignal, LabelsType, LengthsType, MaskType, NeuralType
 from nemo.utils import logging
 from nemo.utils.trainer_utils import resolve_trainer_cfg
@@ -387,7 +387,7 @@ def oomptimizer(
         model = model_cls(OmegaConf.to_container(cfg.model, resolve=True))
     model = model.to(device)
 
-    if isinstance(model, SALM):
+    if isinstance(model, SALM) or isinstance(model, SALMWithAsrDecoder):
         model.prepare_inputs = partial(_override_prepare_inputs, model)
 
     if not hasattr(model, "oomptimizer_schema"):
@@ -463,7 +463,7 @@ def oomptimizer(
         def __iter__(self):
             gen.reset()
             gen._current = 1
-            yield gen(33, 33)
+            yield gen(100, 100)
             # yield gen(16000, 13)
             gen.reset()
 

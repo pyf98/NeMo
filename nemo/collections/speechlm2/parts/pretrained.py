@@ -47,24 +47,24 @@ def load_pretrained_hf(model_path_or_name: str, pretrained_weights: bool = True,
     but is randomly initialized.
     """
     if pretrained_weights:
-        return AutoModelForCausalLM.from_pretrained(model_path_or_name, torch_dtype=dtype, trust_remote_code=True)
+        return AutoModelForCausalLM.from_pretrained(model_path_or_name, torch_dtype=dtype, trust_remote_code=False)
     else:
-        config = AutoConfig.from_pretrained(model_path_or_name, trust_remote_code=True)
-        return AutoModelForCausalLM.from_config(config, torch_dtype=dtype, trust_remote_code=True)
+        config = AutoConfig.from_pretrained(model_path_or_name, trust_remote_code=False)
+        return AutoModelForCausalLM.from_config(config, torch_dtype=dtype, trust_remote_code=False)
 
 
 @contextmanager
 def move_embedding(model):
     """Temporarily restores the embedding layer into HF LLM. Supports LoRA models."""
     if isinstance(model.llm, PeftModel):
-        model.llm.base_model.model.model.embed_tokens = model.embed_tokens
+        model.llm.base_model.model.model.embeddings = model.embed_tokens
     else:
-        model.llm.model.embed_tokens = model.embed_tokens
+        model.llm.model.embeddings = model.embed_tokens
     yield
     if isinstance(model.llm, PeftModel):
-        del model.llm.base_model.model.model.embed_tokens
+        del model.llm.base_model.model.model.embeddings
     else:
-        del model.llm.model.embed_tokens
+        del model.llm.model.embeddings
 
 
 def setup_audio_codec(model: torch.nn.Module):

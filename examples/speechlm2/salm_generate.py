@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import partial
 from time import perf_counter
 from typing import Optional
@@ -44,9 +44,13 @@ class SalmEvalConfig:
     verbose: bool = True
     device: str = "cuda"
     dtype: str = "bfloat16"
-    extra_eos_tokens: Optional[list[str]] = None
-    system_prompt: Optional[str] = None
+    extra_eos_tokens: Optional[list[str]] = field(default_factory=lambda: ["<SPECIAL_12>"])
+    system_prompt: Optional[str] = "/no_think"
     user_prompt: Optional[str] = None
+    num_beams: int = 1
+    do_sample: bool = False
+    temperature: float = 0.6
+    top_p: float = 0.95
 
 
 @hydra_runner(config_name="SalmEvalConfig", schema=SalmEvalConfig)
@@ -118,6 +122,10 @@ def main(cfg: SalmEvalConfig):
                 bos_token_id=model.text_bos_id,
                 eos_token_id=eos_tokens,
                 pad_token_id=model.text_pad_id,
+                num_beams=cfg.num_beams,
+                do_sample=cfg.do_sample,
+                temperature=cfg.temperature,
+                top_p=cfg.top_p,
             ),
         )
         answer_ids = answer_ids.cpu()

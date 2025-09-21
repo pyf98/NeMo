@@ -74,13 +74,15 @@ class SALMWithAsrDecoder(LightningModule, HFHubMixin):
         self.tokenizer.add_special_tokens({"additional_special_tokens": [self.audio_locator_tag]})
         self.llm = load_pretrained_hf(self.cfg.pretrained_llm, pretrained_weights=self.cfg.pretrained_weights)
         if not hasattr(self.llm, "model") and hasattr(self.llm, "backbone"):
-            type(self.llm).model = property(lambda self: self.backbone)
+            # type(self.llm).model = property(lambda self: self.backbone)
+            self.llm.model = self.llm.backbone
         if not hasattr(self.llm.model, "embed_tokens") and hasattr(self.llm.model, "embeddings"):
             self.llm.model.embed_tokens = self.llm.model.embeddings
         # Note: we have to "move out" the token embedding outside of LLM to avoid
         #       messing up FSDP/TP hooks.
         self.embed_tokens = self.llm.model.embed_tokens
         del self.llm.model.embed_tokens
+        del self.llm.model.embeddings
 
         # Load the pretrained streaming ASR model and copy its parameters into the audio perception module.
         setup_speech_encoder_with_asr(self, pretrained_weights=self.cfg.pretrained_weights)
@@ -362,6 +364,7 @@ class SALMWithAsrDecoder(LightningModule, HFHubMixin):
             if self.cfg.get("val_save_path", None) is not None:
                 convs_no_answer = [strip_response_if_any(conv) for conv in dataset_batch["conversations"]]
                 convs_no_answer = [tokenize_with_prompt(conv, self.tokenizer, self.cfg.prompt_format) for conv in convs_no_answer]
+                eos_token_ids = [self.text_eos_id, self.tokenizer.token_to_id("<SPECIAL_12>")]
                 answer_ids = self.generate(
                     prompts=left_collate_vectors([c.input_ids for c in convs_no_answer], padding_value=self.text_pad_id).to(self.device),
                     audios=dataset_batch["audios"].to(self.device, non_blocking=True),
@@ -369,14 +372,14 @@ class SALMWithAsrDecoder(LightningModule, HFHubMixin):
                     generation_config=GenerationConfig(
                         max_new_tokens=128,
                         bos_token_id=self.text_bos_id,
-                        eos_token_id=[self.text_eos_id],
+                        eos_token_id=eos_token_ids,
                         pad_token_id=self.text_pad_id,
                         do_sample=False,
                         num_beams=1,  # greedy decoding
                     ),
                 )
                 answer_ids = answer_ids.cpu()
-                answer_ids = [parse_hyp(ans, [self.text_eos_id]) for ans in answer_ids]
+                answer_ids = [parse_hyp(ans, eos_token_ids) for ans in answer_ids]
                 batch_answers = [self.tokenizer.ids_to_text(ans) for ans in answer_ids]
                 for conv, ans in zip(convs_no_answer, batch_answers):
                     conv.turns.append(TextTurn(role="assistant", value=ans))
