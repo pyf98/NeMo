@@ -233,7 +233,7 @@ class SALMWithAsrDecoder(LightningModule, HFHubMixin):
         }
 
     def training_step(self, batch: dict, batch_idx: int):
-        for m in (self.perception.preprocessor, self.perception.encoder, self.llm):
+        for m in (self.perception.asr, self.perception.preprocessor, self.perception.encoder, self.llm, self.embed_tokens):
             if is_frozen(m):
                 m.eval()
 
