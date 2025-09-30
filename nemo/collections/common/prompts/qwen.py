@@ -85,7 +85,7 @@ class Qwen3PromptFormatter(PromptFormatter):
             if "content" in turn:
                 turn["slots"] = {"message": turn.pop("content")}
 
-        # 2) Determine if thinking is enabled in user or system turns.
+        # 1) Determine if thinking is enabled in user or system turns.
         # If multiple turns have the tag, we will use the last one.
         # This is for inference only.
         enable_thinking = False
@@ -97,13 +97,16 @@ class Qwen3PromptFormatter(PromptFormatter):
                     enable_thinking = False
                 turn["slots"]["message"] = turn["slots"]["message"].replace("/think", "").replace("/no_think", "").strip()
 
-        # 3) Remove thinking content from previous turns. This is for both training and inference.
+        # 2) Remove thinking content from previous turns. This is for both training and inference.
         for turn in turns[:-1]:
             if turn["role"] == self.OUTPUT_ROLE:
                 if "</think>" in turn["slots"]["message"]:
                     turn["slots"]["message"] = turn["slots"]["message"].split("</think>")[1].strip()
 
-        # 4) Add empty thinking content to the last assistant turn if not present. This is for training only.
+        # 3) Add empty thinking content to the last assistant turn if not present.
+        # Also normalize the thinking format:
+        # <think>\n" + reasoning_content.strip("\n") + "\n</think>\n\n" + content.lstrip("\n")
+        # This is for training only.
         turn = turns[-1]
         if turn["role"] == self.OUTPUT_ROLE:
             if "<think>" not in turn["slots"]["message"]:
@@ -111,7 +114,9 @@ class Qwen3PromptFormatter(PromptFormatter):
             else:
                 assert turn["slots"]["message"].startswith("<think>"), turn["slots"]["message"]
                 assert "</think>" in turn["slots"]["message"], turn["slots"]["message"]
-
+                reasoning_content = turn["slots"]["message"].split("<think>")[1].split("</think>")[0].strip("\n")
+                content = turn["slots"]["message"].split("</think>")[1].lstrip("\n")
+                turn["slots"]["message"] = f"<think>\n{reasoning_content}\n</think>\n\n{content}"
 
         turn_tokens = []
         turn_token_counts = []
