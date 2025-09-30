@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # pylint: disable=C0115
+import random
+
 import torch
 from nemo.collections.common.prompts.formatter import Modality, PromptFormatter
 
@@ -65,12 +67,12 @@ class Qwen3PromptFormatter(PromptFormatter):
         },
     }
 
-    def encode_dialog(self, turns: list[dict]) -> dict[str, torch.Tensor]:
+    def encode_dialog(self, turns: list[dict], enable_thinking: bool = True) -> dict[str, torch.Tensor]:
         """Overrides the base class method.
 
         Args:
             turns (list[dict]): List of turns. Each turn is a dict with "role" and "slots" keys.
-
+            enable_thinking (bool): Whether to enable thinking. If False, an empty thinking block will be added.
         """
 
         roles = self.get_roles()
@@ -80,43 +82,77 @@ class Qwen3PromptFormatter(PromptFormatter):
             assert turn["role"] in roles, f"Found turn with {turn['role']=}, but available roles are {roles}"
 
         # Preprocess turns based on Qwen3 prompt format
+        # Our training data format:
+        # - The final assistant turn can have: (1) no thinking tags, (2) empty thinking, (3) non-empty thinking
+        # - System and user turns do not have "/think" or "/no_think" tags
+        # - There can be an empty system turn at the beginning
+        # Our inference data format:
+        # - System and user turns can have "/think" or "/no_think" tags
+
         # 0) Unify the format of turns to have "role" and "slots" keys.
         for turn in turns:
             if "content" in turn:
                 turn["slots"] = {"message": turn.pop("content")}
 
-        # 1) Determine if thinking is enabled in user or system turns.
+        # 1) (Inference, Optional) Determine if thinking is enabled in user or system turns.
         # If multiple turns have the tag, we will use the last one.
-        # This is for inference only.
-        enable_thinking = False
-        for turn in turns:
-            if turn["role"] == "user" or turn["role"] == "system":
-                if "/think" in turn["slots"]["message"]:
-                    enable_thinking = True
-                elif "/no_think" in turn["slots"]["message"]:
-                    enable_thinking = False
-                turn["slots"]["message"] = turn["slots"]["message"].replace("/think", "").replace("/no_think", "").strip()
+        # enable_thinking = True  # By default, it is enabled according to Qwen3 prompt format
+        # for turn in turns:
+        #     if turn["role"] == "user" or turn["role"] == "system":
+        #         if "/think" in turn["slots"]["message"]:
+        #             enable_thinking = True
+        #         elif "/no_think" in turn["slots"]["message"]:
+        #             enable_thinking = False
 
-        # 2) Remove thinking content from previous turns. This is for both training and inference.
+        # 2) (Training and Inference) Remove thinking content from previous turns.
         for turn in turns[:-1]:
             if turn["role"] == self.OUTPUT_ROLE:
                 if "</think>" in turn["slots"]["message"]:
                     turn["slots"]["message"] = turn["slots"]["message"].split("</think>")[1].strip()
 
-        # 3) Add empty thinking content to the last assistant turn if not present.
+        # 3) (Training) Handle the thinking content of the last assistant turn.
         # Also normalize the thinking format:
         # <think>\n" + reasoning_content.strip("\n") + "\n</think>\n\n" + content.lstrip("\n")
-        # This is for training only.
+        # Find all system and user turns
+        system_and_user_turns = [turn for turn in turns if turn["role"] == "system" or turn["role"] == "user"]
         turn = turns[-1]
         if turn["role"] == self.OUTPUT_ROLE:
             if "<think>" not in turn["slots"]["message"]:
+                assert "</think>" not in turn["slots"]["message"], turn["slots"]["message"]
+                # Add empty thinking block
                 turn["slots"]["message"] = self.NO_THINK_PREFIX + turn["slots"]["message"]
+                # A simplified version: add only one "/no_think" to a previous user or system turn
+                random_turn = random.choice(system_and_user_turns)
+                if random.random() < 0.5:
+                    random_turn["slots"]["message"] = random_turn["slots"]["message"] + " /no_think"
+                else:
+                    random_turn["slots"]["message"] = "/no_think " + random_turn["slots"]["message"]
             else:
                 assert turn["slots"]["message"].startswith("<think>"), turn["slots"]["message"]
                 assert "</think>" in turn["slots"]["message"], turn["slots"]["message"]
-                reasoning_content = turn["slots"]["message"].split("<think>")[1].split("</think>")[0].strip("\n")
+                reasoning_content = turn["slots"]["message"].split("<think>")[1].split("</think>")[0].strip()
                 content = turn["slots"]["message"].split("</think>")[1].lstrip("\n")
                 turn["slots"]["message"] = f"<think>\n{reasoning_content}\n</think>\n\n{content}"
+
+                if not reasoning_content:
+                    # A simplified version: add only one "/no_think" to a previous user or system turn
+                    random_turn = random.choice(system_and_user_turns)
+                    if random.random() < 0.5:
+                        random_turn["slots"]["message"] = random_turn["slots"]["message"] + " /no_think"
+                    else:
+                        random_turn["slots"]["message"] = "/no_think " + random_turn["slots"]["message"]
+                else:
+                    # Add "/think" or nothing
+                    if random.random() < 0.5:
+                        random_turn = random.choice(system_and_user_turns)
+                        if random.random() < 0.5:
+                            random_turn["slots"]["message"] = random_turn["slots"]["message"] + " /think"
+                        else:
+                            random_turn["slots"]["message"] = "/think " + random_turn["slots"]["message"]
+
+        # 4) (Training and Inference) Remove empty system turn
+        if turns[0]["role"] == "system" and turns[0]["slots"]["message"].strip() == "":
+            turns = turns[1:]
 
         turn_tokens = []
         turn_token_counts = []
@@ -126,15 +162,6 @@ class Qwen3PromptFormatter(PromptFormatter):
             turn_tokens.append(self.tokenizer.bos)
             turn_token_counts.append(1)
             turn_mask_values.append(False)
-
-        if "preamble" in self.TEMPLATE:
-            preamble_turns = [idx for idx, t in enumerate(turns) if t["role"] == "preamble"]
-            if not preamble_turns:
-                turns = [{"role": "preamble", **self.TEMPLATE["preamble"]}] + turns
-            else:
-                assert (
-                    len(preamble_turns) == 1 and preamble_turns[0] == 0
-                ), f"Preamble can only be presented at turn 0 but we found preamble turns at indexes {preamble_turns}."
 
         is_inference = turns[-1]["role"] != self.OUTPUT_ROLE
         for idx, turn in enumerate(turns):
@@ -160,10 +187,10 @@ class Qwen3PromptFormatter(PromptFormatter):
             turn_mask_values.append(role == self.OUTPUT_ROLE and idx == len(turns) - 1)
 
         if is_inference and self.INFERENCE_PREFIX is not None:
-            inference_prefix_with_thinking = self.INFERENCE_PREFIX
+            inference_prefix = self.INFERENCE_PREFIX
             if not enable_thinking:
-                inference_prefix_with_thinking = inference_prefix_with_thinking + self.NO_THINK_PREFIX
-            inference_prefix = self._apply_tokenizer(inference_prefix_with_thinking)
+                inference_prefix = inference_prefix + self.NO_THINK_PREFIX
+            inference_prefix = self._apply_tokenizer(inference_prefix)
             turn_tokens.extend(inference_prefix)
             turn_token_counts.append(len(inference_prefix))
             turn_mask_values.append(False)  # not a training example
@@ -190,4 +217,5 @@ class Qwen3PromptFormatter(PromptFormatter):
             )
         else:
             ans["context_ids"] = ans["input_ids"]  # context == input for inference
+
         return ans
