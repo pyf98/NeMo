@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import partial
 from time import perf_counter
 from typing import Optional
@@ -47,10 +47,12 @@ class SalmEvalConfig:
     extra_eos_tokens: Optional[list[str]] = None
     system_prompt: Optional[str] = None
     user_prompt: Optional[str] = None
+    generation_kwargs: dict = field(default_factory=dict)
 
 
 @hydra_runner(config_name="SalmEvalConfig", schema=SalmEvalConfig)
 def main(cfg: SalmEvalConfig):
+    OmegaConf.resolve(cfg)
     logging.info(f"Hydra config:\n{OmegaConf.to_yaml(cfg)}")
 
     model = SALMWithAsrDecoder.from_pretrained(cfg.pretrained_name).eval().to(getattr(torch, cfg.dtype)).to(cfg.device)
@@ -119,6 +121,7 @@ def main(cfg: SalmEvalConfig):
                 eos_token_id=eos_tokens,
                 pad_token_id=model.text_pad_id,
             ),
+            **cfg.generation_kwargs,
         )
         answer_ids = answer_ids.cpu()
         batch_infer_duration = perf_counter() - ts
@@ -128,7 +131,13 @@ def main(cfg: SalmEvalConfig):
         batch_num_answer_tokens = [len(ans) for ans in answer_ids]
         batch_answers = [model.tokenizer.ids_to_text(ans) for ans in answer_ids]
         for conv, ctx, ans in zip(batch["conversations"], batch_contexts, batch_answers):
-            conv.turns.append(TextTurn(role="assistant", value=ans))
+            # ans has a thinking block <think>...</think>
+            if "</think>" in ans:
+                ans_only = ans.split("</think>")[1].strip()
+            else:
+                ans_only = ans
+            conv.turns.append(TextTurn(role="assistant", value=ans_only))
+            conv.custom["full_response"] = ans
             for k, v in list(conv.custom.items()):
                 if isinstance(v, torch.Tensor):
                     del conv.custom[k]
