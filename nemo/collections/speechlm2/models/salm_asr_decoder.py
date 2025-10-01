@@ -350,7 +350,7 @@ class SALMWithAsrDecoder(LightningModule, HFHubMixin):
 
             except Exception as e:
                 # Skip the dataset if there is an error, e.g., the dataset does not have answers
-                logging.warning_once(f"Error in validation step for dataset {name}: {e}")
+                logging.warning(f"Error in validation step for dataset {name}: {e}")
 
             # Run autoregressive generation and collect results (writing happens at epoch end)
             if self.cfg.get("val_save_path", None) is not None:
