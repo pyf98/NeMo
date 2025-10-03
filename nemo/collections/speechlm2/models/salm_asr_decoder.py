@@ -384,13 +384,84 @@ class SALMWithAsrDecoder(LightningModule, HFHubMixin):
                     self._val_generations[name].append(conv.to_dict())
 
     def on_test_epoch_start(self) -> None:
-        return self.on_validation_epoch_start()
+        # collect generations per test set (per-rank)
+        self._test_generations = defaultdict(list)
 
     def on_test_epoch_end(self) -> None:
-        return self.on_validation_epoch_end()
+        # Gather and write generations to a single file per dataset (rank 0 only)
+        dist = torch.distributed
+        if dist.is_available() and dist.is_initialized():
+            world_size = dist.get_world_size()
+            gathered = [None for _ in range(world_size)]
+            dist.all_gather_object(gathered, dict(self._test_generations))
+            is_global_zero = dist.get_rank() == 0
+        else:
+            gathered = [dict(self._test_generations)]
+            is_global_zero = True
 
-    def test_step(self, *args: Any, **kwargs: Any):
-        return self.validation_step(*args, **kwargs)
+        if is_global_zero:
+            merged = defaultdict(list)
+            for per_rank_dict in gathered:
+                for name, items in per_rank_dict.items():
+                    merged[name].extend(items)
+
+            test_save_path = Path(self.cfg.test_save_path)
+            test_save_path.mkdir(parents=True, exist_ok=True)
+            for name, items in merged.items():
+                out_path = test_save_path / f"{name}.jsonl"
+                with SequentialJsonlWriter(out_path) as writer:
+                    unique_ids = set()
+                    for obj in items:
+                        if obj["id"] in unique_ids:
+                            # Skip duplicate ids
+                            continue
+                        unique_ids.add(obj["id"])
+                        writer.write(obj)
+
+        self._test_generations.clear()
+
+    def test_step(self, batch: dict, batch_idx: int, dataloader_idx: int = 0):
+        for name, dataset_batch in batch.items():
+            logging.info(
+                f"Dataloader {dataloader_idx}, batch {batch_idx}, dataset {name}, batch_size {len(dataset_batch['conversations'])}"
+            )
+            if dataset_batch is None:
+                continue  # some dataset is exhausted
+
+            # Run autoregressive generation and collect results (writing happens at epoch end)
+            convs_no_answer = [strip_response_if_any(conv) for conv in dataset_batch["conversations"]]
+            convs_no_answer = [
+                tokenize_with_prompt(conv, self.tokenizer, self.cfg.prompt_format) for conv in convs_no_answer
+            ]
+            answer_ids = self.generate(
+                prompts=left_collate_vectors(
+                    [c.input_ids for c in convs_no_answer], padding_value=self.text_pad_id
+                ).to(self.device),
+                audios=dataset_batch["audios"].to(self.device, non_blocking=True),
+                audio_lens=dataset_batch["audio_lens"].to(self.device, non_blocking=True),
+                generation_config=GenerationConfig(
+                    bos_token_id=self.text_bos_id,
+                    eos_token_id=[self.text_eos_id],
+                    pad_token_id=self.text_pad_id,
+                    **self.cfg.generation_config,
+                ),
+            )
+            answer_ids = answer_ids.cpu()
+            answer_ids = [parse_hyp(ans, [self.text_eos_id]) for ans in answer_ids]
+            batch_answers = [self.tokenizer.ids_to_text(ans) for ans in answer_ids]
+
+            for conv, ans in zip(convs_no_answer, batch_answers):
+                # ans might have a thinking block <think>...</think>
+                if "</think>" in ans:
+                    ans_only = ans.split("</think>")[1].strip()
+                else:
+                    ans_only = ans
+                conv.turns.append(TextTurn(role="assistant", value=ans_only))
+                conv.custom["full_response"] = ans
+                for k, v in list(conv.custom.items()):
+                    if isinstance(v, torch.Tensor):
+                        del conv.custom[k]
+                self._test_generations[name].append(conv.to_dict())
 
     def backward(self, *args, **kwargs):
         with loss_parallel():

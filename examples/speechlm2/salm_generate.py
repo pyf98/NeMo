@@ -48,6 +48,9 @@ class SalmEvalConfig:
     system_prompt: Optional[str] = None
     user_prompt: Optional[str] = None
     generation_kwargs: dict = field(default_factory=dict)
+    # sharding information
+    num_shards: int = 1
+    shard_id: int = 0
 
 
 @hydra_runner(config_name="SalmEvalConfig", schema=SalmEvalConfig)
@@ -88,11 +91,21 @@ def main(cfg: SalmEvalConfig):
             apply_fn=None,
         )
     )
-    conversations = sort_by_length(conversations)
+    # conversations = sort_by_length(conversations)
+    if cfg.num_shards > 1:
+        conversations = conversations.split(
+            num_splits=cfg.num_shards, shuffle=False, drop_last=False
+        )[cfg.shard_id]
     dloader = torch.utils.data.DataLoader(
         dataset=IterableDatasetWrapper(
             dataset=SALMDataset(model.tokenizer),
-            sampler=lhotse.dataset.DynamicCutSampler(conversations, max_cuts=cfg.batch_size),
+            sampler=lhotse.dataset.DynamicCutSampler(
+                conversations,
+                max_cuts=cfg.batch_size,
+                # NOTE: We manually shard the data, so we disable distributed sampling
+                world_size=1,
+                rank=0,
+            ),
         ),
         num_workers=1,
         batch_size=None,
